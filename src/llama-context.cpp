@@ -2152,6 +2152,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         ggml_backend_event_wait(layer_inp_backend, ev_layer_inp_read.get());
     }
 
+    bool has_next_ubatch  = false;
+    bool mtp_multi_ubatch = false;
+
     do {
         const auto & ubatch = mctx->get_ubatch();
 
@@ -2336,7 +2339,15 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
         n_outputs_prev += n_outputs;
         n_tokens_prev  += ubatch.n_tokens;
-    } while (mctx->next());
+
+        has_next_ubatch = mctx->next();
+        mtp_multi_ubatch |= has_next_ubatch;
+
+        // MTP ubatches update the same KV cache and must complete in order.
+        if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && mtp_multi_ubatch) {
+            synchronize();
+        }
+    } while (has_next_ubatch);
 
     if (layer_inp_dev && ev_layer_inp_written) {
         ggml_backend_event_record(ev_layer_inp_written.get(), layer_inp_backend);
