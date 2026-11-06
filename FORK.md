@@ -181,6 +181,14 @@ backend stall. Also groundwork for finer-grained overlap later.
 | A2 P2P tri-state | auto-enable where supported, tolerate failures | no regression; P2P used only where actually supported | measured: neutral on the no-P2P pair, PP 135.86 vs 135.88 / TG 12.93 vs 13.17, identical output ([details](HYBRID_LAYER_SPLIT_BENCHMARK.md)) |
 | A3 half2 K-quant dequant | 2 elements/thread, one 32-bit store | fewer stores and index ops on the Q4_K/Q5_K/Q6_K to f16 path; bit-exact output | bounded: A2+A3+A4 jointly ≈ 0% PP / +1.7% TG vs the pre-A1 build, bit-identical output ([details](HYBRID_LAYER_SPLIT_BENCHMARK.md)); A1-engaging legs don't touch it |
 | A4 PP fences | per-backend events replace blanket synchronize | same timing semantics; less bookkeeping; groundwork for async overlap | not exercised in the measured workload (no pipeline-parallel reuse path) |
+| A11 `-ts` sweep harness | scripted benchmark sweep over tensor-split fractions | operator picks the ts optimum without hand-rolling runs | pending |
+| A15 FA kernel one-shot log | `GGML_CUDA_FA_DEBUG` one-shot per-device kernel-selection audit | diagnostics only; no runtime cost when off | pending |
+| A9 AR spin/blocks env | `GGML_CUDA_AR_SPIN_CYCLES`, `GGML_CUDA_AR_KERNEL_BLOCKS` runtime knobs | latency tuning for the AR poll interval and SM occupancy on Pascal | pending |
+| A10 BF16 AR wire verification | verify the always-on F32→BF16 reduction wire | confirms A10's claimed on-wire saving and numerics | pending |
+| A5 MTP draft pin | `LLAMA_MTP_PIN` pins draft layers + KV to the output device | removes the per-draft-step cross-GPU hidden-state hop | pending |
+| A12 AR capture guard | refuse AR under CUDA stream capture, fall back to plain copies | protects graph replay correctness if AR is ever invoked captured | pending |
+| A13 output pin | `LLAMA_OUTPUT_PIN` pins the logits head to the last device | explicit, testable per-token logits residency | pending |
+| A16 arch gate | `scripts/check-arch.ps1` SASS readback + startup cc banner | catches silent `-DCMAKE_CUDA_ARCHITECTURES` drift; triages slow-device reports | measured: PASS/FAIL verified against the live binary (61,86 present; 89 correctly fails) |
 
 Three measured results exist so far: the MMQ tile-width experiment
 ([details](MMQ_PASCAL_TILE_EXPERIMENT.md)), refuted and reverted; the A1
@@ -227,6 +235,12 @@ cmake --build build --config Release
 | `GGML_CUDA_AR_DISABLE` | set | disable internal AllReduce, use fallback |
 | `LLAMA_LAYER_SPLIT_HYBRID` | `attn`, `attn:N`, `off` | hybrid-aware attention placement (A1) |
 | `GGML_CUDA_P2P` | unset/`1`, `0` | auto/on, off (A2) |
+| `GGML_CUDA_FA_DEBUG` | set | one-shot audit log of flash-attention kernel selection per device (A15) |
+| `GGML_CUDA_AR_SPIN_CYCLES` | 0..2^20 (default 16384) | pre-Volta AR poll throttle in SM cycles; 0 removes the throttle (A9) |
+| `GGML_CUDA_AR_KERNEL_BLOCKS` | 1..32 (default 8) | chunked AR kernel grid size (A9) |
+| `GGML_CUDA_AR_GRAPH_GUARD` | unset/`1`, `0` | default on: skip internal AR when a participating stream is capturing (A12) |
+| `LLAMA_MTP_PIN` | `off`/unset (default), any other value | pin MTP draft layers + their KV to the output device (A5) |
+| `LLAMA_OUTPUT_PIN` | `off`/unset (default), any other value | pin the output/logits head to the last GPU device (A13) |
 
 All other behavior is unchanged from upstream. No files are written, no
 telemetry is added, and no persistent configuration is modified.
