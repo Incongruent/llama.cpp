@@ -2789,6 +2789,26 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_SPLIT_MODE"));
     add_opt(common_arg(
+        {"--layer-split-hybrid"}, "{attn,attn:N,off}",
+        "hybrid attention layer placement across two GPUs, one of:\n"
+        "- attn: place all full-attention layers on device 0\n"
+        "- attn:N (N >= 0): place the first N full-attention layers on device 0\n"
+        "- off (default): standard layer split by tensor_split\n"
+        "requires a hybrid-recurrent model and exactly 2 devices; ignores tensor_split when set",
+        [](common_params & params, const std::string & value) {
+            if (value != "off" && value != "attn" && !(value.rfind("attn:", 0) == 0 && !value.empty()) ) {
+                throw std::invalid_argument("invalid value");
+            }
+            if (value.rfind("attn:", 0) == 0) {
+                const std::string q = value.substr(5);
+                if (q.empty() || q.find_first_not_of("0123456789") != std::string::npos || q.size() > 6) {
+                    throw std::invalid_argument("invalid value");
+                }
+            }
+            params.layer_split_hybrid = value;
+        }
+    ).set_env("LLAMA_ARG_LAYER_SPLIT_HYBRID"));
+    add_opt(common_arg(
         {"-ts", "--tensor-split"}, "N0,N1,N2,...",
         "fraction of the model to offload to each GPU, comma-separated list of proportions, e.g. 3,1",
         [](common_params & params, const std::string & value) {
