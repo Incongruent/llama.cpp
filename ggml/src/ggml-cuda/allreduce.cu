@@ -168,7 +168,17 @@ static __global__ void ggml_cuda_ar_kernel(
 #elif __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
             __nanosleep(100);
 #else
-            NO_DEVICE_CODE;
+            // Pascal (no __nanosleep): the volatile read above is itself a
+            // PCIe round-trip (~1.5-2.5 us), so an unthrottled spin from 8
+            // blocks would push tens to hundreds of MB/s of 64 B read TLPs
+            // over the same link carrying the reduction data.  Delay ~16k
+            // SM cycles (8-11 us at 1.5-2 GHz) between polls; the token's
+            // propagation latency (a few us) dominates, so the expected
+            // added latency per AR is half a poll interval.
+            const unsigned int spin_start = clock();
+            while (clock() - spin_start < 16384U) {
+                // delay
+            }
 #endif // GGML_USE_HIP
         }
     }
@@ -405,14 +415,23 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
         return nullptr;
     }
 
-    // The chunked kernel uses __nanosleep (NVIDIA, sm70+) or
-    // __builtin_amdgcn_s_sleep (AMD).
+    if (getenv("GGML_CUDA_AR_DISABLE") != nullptr) {
+        GGML_LOG_DEBUG("%s: internal AllReduce disabled via GGML_CUDA_AR_DISABLE; falling back\n",
+                       __func__);
+        return nullptr;
+    }
+
+    // The chunked-kernel spin uses __nanosleep (NVIDIA, sm70+),
+    // __builtin_amdgcn_s_sleep (AMD), or a clock() delay loop (sm61+).
+    // 6.1 (Pascal DP4A: GP102/GP104, e.g. P40) is the minimum supported
+    // NVIDIA class; everything else the pipeline uses (mapped pinned
+    // memory, volatile system fences, events, copy engine) is arch-neutral.
     for (size_t i = 0; i < n_devices; ++i) {
         const int cc = ggml_cuda_info().devices[devices[i]].cc;
-        if (cc < GGML_CUDA_CC_VOLTA) {
+        if (cc < GGML_CUDA_CC_DP4A) {
             GGML_LOG_DEBUG("%s: internal AllReduce requires compute capability >= %d "
                            "(device %d has cc=%d); falling back\n",
-                           __func__, GGML_CUDA_CC_VOLTA, devices[i], cc);
+                           __func__, GGML_CUDA_CC_DP4A, devices[i], cc);
             return nullptr;
         }
     }
