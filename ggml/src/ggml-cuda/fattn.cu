@@ -5,6 +5,8 @@
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
 
+#include <set>
+
 #if !defined(GGML_USE_MUSA)
 
 // one list per group of ncols1 queries: a column is selected if any query of the group can see it
@@ -559,7 +561,7 @@ static bool ggml_cuda_fattn_kv_type_supported(const ggml_type type) {
     }
 }
 
-static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
+static best_fattn_kernel ggml_cuda_get_best_fattn_kernel_impl(const int device, const ggml_tensor * dst) {
 #ifndef FLASH_ATTN_AVAILABLE
     GGML_UNUSED(device); GGML_UNUSED(dst);
     return BEST_FATTN_KERNEL_NONE;
@@ -753,6 +755,52 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         }
     }
     return BEST_FATTN_KERNEL_TILE;
+}
+
+// A15 audit: one-shot log of the selected flash-attention kernel per
+// (device, kernel, Q shape, KV types), gated by GGML_CUDA_FA_DEBUG.
+// TILE = prefill kernel, VEC = decode kernel, NONE = would leave the CUDA
+// backend (silent fallback candidate). Same one-shot idiom as the MMQ log.
+static bool ggml_cuda_fattn_debug_enabled() {
+    static const bool enabled = getenv("GGML_CUDA_FA_DEBUG") != nullptr;
+    return enabled;
+}
+
+static const char * ggml_cuda_fattn_kernel_name(best_fattn_kernel k) {
+    switch (k) {
+        case BEST_FATTN_KERNEL_VEC:
+            return "VEC";
+        case BEST_FATTN_KERNEL_TILE:
+            return "TILE";
+        case BEST_FATTN_KERNEL_MMA_F16:
+            return "MMA_F16";
+        default:
+            return "NONE";
+    }
+}
+
+static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
+    const best_fattn_kernel kernel = ggml_cuda_get_best_fattn_kernel_impl(device, dst);
+    if (ggml_cuda_fattn_debug_enabled()) {
+        static std::set<uint32_t> logged;
+        const ggml_tensor * Q = dst->src[0];
+        const ggml_tensor * K = dst->src[1];
+        const ggml_tensor * V = dst->src[2];
+        uint32_t key = (uint32_t) (device * 100003u + (uint32_t) kernel);
+        key = key * 131u + (uint32_t) Q->ne[0];
+        key = key * 131u + (uint32_t) Q->ne[1];
+        key = key * 131u + (uint32_t) K->type;
+        key = key * 131u + (uint32_t) V->type;
+        if (logged.insert(key).second) {
+            const int cc = ggml_cuda_info().devices[device].cc;
+            GGML_LOG_DEBUG("ggml_cuda: [FA] dev %d cc %d kernel %s Q[%ld,%ld] kv %s/%s ne10=%ld ne11=%ld gqa=%ld\n",
+                           device, cc, ggml_cuda_fattn_kernel_name(kernel),
+                           (long) Q->ne[0], (long) Q->ne[1],
+                           ggml_type_name(K->type), ggml_type_name(V->type),
+                           (long) K->ne[0], (long) K->ne[1], (long) (Q->ne[2] / K->ne[2]));
+        }
+    }
+    return kernel;
 }
 
 size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * dst) {
