@@ -580,6 +580,21 @@ llama_context::llama_context(
 
         if (cparams.pipeline_parallel) {
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
+
+            // per-backend ubatch fences (A4): recorded after each ubatch's async
+            // compute is enqueued, waited on before the following set_inputs, replacing
+            // the blanket backend synchronize (only async GPU backends need a wait)
+            for (auto & backend : backends) {
+                auto * dev = ggml_backend_get_device(backend.get());
+                if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                    continue;
+                }
+                ggml_backend_event_ptr event(ggml_backend_event_new(dev));
+                if (!event) {
+                    continue;
+                }
+                ev_ubatch_fences.push_back({backend.get(), std::move(event)});
+            }
         }
 
         if (cparams.moe_cache_size > 0) {
@@ -1663,10 +1678,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
-        // on the GPU. we must synchronize before set_inputs to avoid overwriting input tensors
-        // that the previous compute is still reading.
+        // on the GPU backends. we must synchronize before set_inputs to avoid overwriting
+        // input tensors that the previous compute is still reading. only the async GPU
+        // backends need a wait; the CPU backend runs synchronously (A4).
         if (cparams.pipeline_parallel) {
-            ggml_backend_sched_synchronize(sched.get());
+            for (const auto & fence : ev_ubatch_fences) {
+                if (fence.event) {
+                    ggml_backend_event_synchronize(fence.event.get());
+                }
+            }
         }
 
         n_reused++;
@@ -1713,6 +1733,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
         return nullptr;
+    }
+
+    // record the per-backend fences for this ubatch so the next set_inputs can wait
+    // on each GPU backend's completion of the asynchronously-running compute (A4)
+    for (const auto & fence : ev_ubatch_fences) {
+        if (fence.event) {
+            ggml_backend_event_record(fence.event.get(), fence.backend);
+        }
     }
 
     ret = GGML_STATUS_SUCCESS;
