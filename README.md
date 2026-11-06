@@ -1,5 +1,9 @@
 # llama.cpp
 
+> [!NOTE]
+> **Fork:** this branch adds mixed-generation multi-GPU support (Ampere + Pascal-class devices over PCIe).
+> See [FORK.md](FORK.md) for the intent, the pre-A1 and A1–A4 changes, and performance notes.
+
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
 
 <div align="center">
