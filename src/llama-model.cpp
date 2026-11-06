@@ -1838,6 +1838,24 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // assign the output layer
     pimpl->dev_output = get_layer_buft_list(n_layer_all);
 
+    // A13: optionally pin the output layer (logits head) to the last device.
+    // Rationale: with tensor-splits the output layer normally lands on the
+    // last GPU all by itself (its il/n_layer fraction exceeds the last split
+    // boundary), but an override-tensor or a partial offload can put it
+    // elsewhere (CPU/CUDA0).  Pinning makes the per-token logits residency
+    // explicit and testable.  Default off (LLAMA_OUTPUT_PIN).
+    if (const char * output_pin = getenv("LLAMA_OUTPUT_PIN")) {
+        if (output_pin[0] != '\0' && strcmp(output_pin, "off") != 0) {
+            if (!devices.empty()) {
+                auto * dev = devices.back().dev;
+                pimpl->dev_output = { dev, &pimpl->gpu_buft_list.at(dev) };
+                LLAMA_LOG_INFO("%s: LLAMA_OUTPUT_PIN: output layer pinned to device %s\n", __func__, ggml_backend_dev_name(dev));
+            } else {
+                LLAMA_LOG_WARN("%s: LLAMA_OUTPUT_PIN set but no GPU devices, ignored\n", __func__);
+            }
+        }
+    }
+
     // A5: resolve the draft pin target now that the output device is known
     if (mtp_pin_wanted) {
         for (size_t di = 0; di < n_devices(); ++di) {
