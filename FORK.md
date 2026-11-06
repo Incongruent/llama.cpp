@@ -106,6 +106,12 @@ memory. On a fast-small + slow-large pair, the default proportional split
 puts some attention layers on the slow device. This knob lets the operator
 put all (or a bounded number of) attention layers on the fast device.
 
+Measured on the target pair with the target workload (100,490-token
+prefill + 512-token generation): `attn:12` on the RTX 3080 gives PP +34.6%
+and TG +23.2% over the same build at `off`; it is also the largest quota
+that fits the 10 GB card. Details and the fit boundary:
+[HYBRID_LAYER_SPLIT_BENCHMARK.md](HYBRID_LAYER_SPLIT_BENCHMARK.md).
+
 ### A2 — P2P setup is tri-state and tolerant (`GGML_CUDA_P2P`)
 
 Before: presence of the environment variable enabled P2P, absence disabled
@@ -171,15 +177,20 @@ backend stall. Also groundwork for finer-grained overlap later.
 | --- | --- | --- | --- |
 | Pascal internal AllReduce | `clock()` spin, cc gate lowered, opt-out env | Internal AR available on cc 6.1; lower AR latency than the no-NCCL fallback; ~8–11 µs poll interval keeps PCIe TLP traffic negligible | pending |
 | MMQ log + tile A/B | one-shot log; `I` 64→32 experiment | log is diagnostic; the tile-width experiment was refuted (−16…−25% PP, no occupancy gain) and reverted | measured: rejected ([details](MMQ_PASCAL_TILE_EXPERIMENT.md)) |
-| A1 hybrid placement | attention layers pinned to device 0 | operator-tunable balance: latency-critical layers on the fast device, capacity on the large device | pending |
-| A2 P2P tri-state | auto-enable where supported, tolerate failures | no regression; P2P used only where actually supported | n/a |
-| A3 half2 K-quant dequant | 2 elements/thread, one 32-bit store | fewer stores and index ops on the Q4_K/Q5_K/Q6_K to f16 path; bit-exact output | pending |
-| A4 PP fences | per-backend events replace blanket synchronize | same timing semantics; less bookkeeping; groundwork for async overlap | pending |
+| A1 hybrid placement | attention layers pinned to device 0 | operator-tunable balance: latency-critical layers on the fast device, capacity on the large device | measured: `attn:12` on 3080+P40, PP +34.6%, TG +23.2% vs off ([details](HYBRID_LAYER_SPLIT_BENCHMARK.md)) |
+| A2 P2P tri-state | auto-enable where supported, tolerate failures | no regression; P2P used only where actually supported | measured: neutral on the no-P2P pair, PP 135.86 vs 135.88 / TG 12.93 vs 13.17, identical output ([details](HYBRID_LAYER_SPLIT_BENCHMARK.md)) |
+| A3 half2 K-quant dequant | 2 elements/thread, one 32-bit store | fewer stores and index ops on the Q4_K/Q5_K/Q6_K to f16 path; bit-exact output | bounded: A2+A3+A4 jointly ≈ 0% PP / +1.7% TG vs the pre-A1 build, bit-identical output ([details](HYBRID_LAYER_SPLIT_BENCHMARK.md)); A1-engaging legs don't touch it |
+| A4 PP fences | per-backend events replace blanket synchronize | same timing semantics; less bookkeeping; groundwork for async overlap | not exercised in the measured workload (no pipeline-parallel reuse path) |
 
-One measured result exists so far: the MMQ tile-width experiment
-([details](MMQ_PASCAL_TILE_EXPERIMENT.md)), where `I=32` was refuted.
-Everything marked "pending" should be treated as expected effects derived
-from the code, not as results.
+Three measured results exist so far: the MMQ tile-width experiment
+([details](MMQ_PASCAL_TILE_EXPERIMENT.md)), refuted and reverted; the A1
+hybrid placement A/B ([details](HYBRID_LAYER_SPLIT_BENCHMARK.md)), with
+`attn:12` at PP +34.6% / TG +23.2% over `off`; and the A2 P2P toggle,
+neutral on the no-P2P pair. Attribution: A1 accounts for the entire
+speedup; A2 is measured neutral, A4 is not exercised by the measured
+workload, and A3 is bounded within the same noise band as A2+A3+A4
+jointly. Everything still marked "pending" should be treated as expected
+effects derived from the code, not as results.
 
 ## Validation status
 
