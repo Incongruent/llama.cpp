@@ -1784,6 +1784,22 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 ggml_backend_dev_name(devices.at(1).dev));
     }
     int n_attn_dev0 = 0;
+    int mtp_pin_dev = -1; // A5: >= 0 when MTP draft layers are pinned (device index)
+
+    // A5: if enabled, MTP draft layers (il >= n_layer) and their KV will be
+    // pinned to the output device, where the draft head's hidden-state input
+    // (layer_inp_dev) is already allocated - co-location avoids a per-token
+    // cross-GPU copy during speculative decoding.  Default off (LLAMA_MTP_PIN).
+    bool mtp_pin_wanted = false;
+    if (const char * mtp_pin = getenv("LLAMA_MTP_PIN")) {
+        if (mtp_pin[0] != '\0' && strcmp(mtp_pin, "off") != 0) {
+            if (hparams.n_layer_nextn > 0 && hparams.router_layer < 0) {
+                mtp_pin_wanted = true;
+            } else {
+                LLAMA_LOG_WARN("%s: LLAMA_MTP_PIN set but model has no MTP draft head (n_layer_nextn = %u), ignored\n", __func__, hparams.n_layer_nextn);
+            }
+        }
+    }
 
     const int i_gpu_start = std::max(n_layer_all + 1 - n_gpu_layers, 0);
     const int act_gpu_layers = devices.empty() ? 0 : std::min(n_gpu_layers, n_layer_all + 1);
@@ -1792,6 +1808,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         if (il < i_gpu_start || (il - i_gpu_start) >= act_gpu_layers) {
             LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(cpu_dev), is_swa);
             return {cpu_dev, &pimpl->cpu_buft_list};
+        }
+        if (mtp_pin_dev >= 0 && il >= (int) hparams.n_layer() && il < n_layer_all) {
+            auto * dev = devices.at(mtp_pin_dev).dev;
+            LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d (MTP pin)\n", il, ggml_backend_dev_name(dev), is_swa);
+            return {dev, &pimpl->gpu_buft_list.at(dev)};
         }
         if (hybrid_attn_dev0 >= 0) {
             const bool is_full_attn = il < (int) hparams.n_layer() && !hparams.is_recr(il);
@@ -1814,14 +1835,30 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // there is very little benefit to offloading the input layer, so always keep it on the CPU
     pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
 
+    // assign the output layer
+    pimpl->dev_output = get_layer_buft_list(n_layer_all);
+
+    // A5: resolve the draft pin target now that the output device is known
+    if (mtp_pin_wanted) {
+        for (size_t di = 0; di < n_devices(); ++di) {
+            if (devices.at(di).dev == pimpl->dev_output.dev) {
+                mtp_pin_dev = (int) di;
+                break;
+            }
+        }
+        if (mtp_pin_dev < 0) {
+            LLAMA_LOG_WARN("%s: LLAMA_MTP_PIN: output layer is not on a GPU, no draft pin\n", __func__);
+        } else {
+            LLAMA_LOG_INFO("%s: LLAMA_MTP_PIN: %u draft layers pinned to output device %s\n",
+                    __func__, hparams.n_layer_nextn, ggml_backend_dev_name(pimpl->dev_output.dev));
+        }
+    }
+
     // assign the repeating layers to the devices according to the splits
     pimpl->dev_layer.resize(n_layer_all);
     for (int il = 0; il < n_layer_all; ++il) {
         pimpl->dev_layer[il] = get_layer_buft_list(il);
     }
-
-    // assign the output layer
-    pimpl->dev_output = get_layer_buft_list(n_layer_all);
 
     const auto TENSOR_NOT_REQUIRED = llama_model_loader::TENSOR_NOT_REQUIRED;
 
