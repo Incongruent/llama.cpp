@@ -414,6 +414,36 @@ static ggml_cuda_device_info ggml_cuda_init() {
             "Consider compiling with CMAKE_CUDA_ARCHITECTURES=61-virtual;80-virtual and DGGML_CUDA_FORCE_MMQ to force the use of the Pascal code for Turing.\n");
     }
 
+    // A16: compute-capability banner.  The binary compiles an explicit arch
+    // list (e.g. -DCMAKE_CUDA_ARCHITECTURES=61;86 for the P40 + RTX 3080 host).
+    // Devices whose cc is missing from the list fall back to the closest
+    // compiled arch (or JIT), which usually works but can run noticeably
+    // slower; surface that mismatch once at startup so a "suddenly slower"
+    // report can be triaged without inspecting the binary.
+#ifdef __CUDA_ARCH_LIST__
+    {
+#define GGML_CUDA_ARCH_LIST_STR2(...) #__VA_ARGS__
+#define GGML_CUDA_ARCH_LIST_STR(x) GGML_CUDA_ARCH_LIST_STR2(x)
+        const char * arch_list = GGML_CUDA_ARCH_LIST_STR(__CUDA_ARCH_LIST__);
+        for (int id = 0; id < info.device_count; ++id) {
+            const int cc = info.devices[id].cc;
+            if (!GGML_CUDA_CC_IS_NVIDIA(cc) || ggml_cuda_has_arch(cc)) {
+                continue;
+            }
+            const int closest = ggml_cuda_highest_compiled_arch(cc);
+            if (closest > 0 && closest < cc) {
+                GGML_LOG_WARN("Device %d: cc %d.%d not in compiled SASS arch list (%s), running closest compiled arch %d - device may run slower\n",
+                              id, cc / 100, (cc / 10) % 10, arch_list, closest);
+            } else if (closest <= 0) {
+                GGML_LOG_WARN("Device %d: cc %d.%d not in compiled SASS arch list (%s), no compiled arch is compatible - device requires PTX JIT\n",
+                              id, cc / 100, (cc / 10) % 10, arch_list);
+            }
+        }
+#undef GGML_CUDA_ARCH_LIST_STR
+#undef GGML_CUDA_ARCH_LIST_STR2
+    }
+#endif // __CUDA_ARCH_LIST__
+
     for (int id = 0; id < info.device_count; ++id) {
         info.default_tensor_split[id] /= total_vram;
     }
