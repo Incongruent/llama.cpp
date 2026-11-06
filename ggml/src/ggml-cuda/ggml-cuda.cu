@@ -174,9 +174,17 @@ static bool ggml_cuda_fusion_disabled() {
     return disabled;
 }
 
+// GGML_CUDA_P2P semantics (A18):
+//   unset -> enabled, on pairs that report cudaDeviceCanAccessPeer support
+//   0     -> disabled even when supported (escape hatch for opt-out)
+//   1     -> equivalent to the default (kept for explicit opt-in)
+static int ggml_cuda_p2p_mode() {
+    static const int mode = ggml_cuda_env_set("GGML_CUDA_P2P") ? ggml_cuda_env_int("GGML_CUDA_P2P", 1) : 2;
+    return mode;
+}
+
 static bool ggml_cuda_p2p_enabled() {
-    static const bool enabled = ggml_cuda_env_set("GGML_CUDA_P2P");
-    return enabled;
+    return ggml_cuda_p2p_mode() != 0;
 }
 
 static int ggml_cuda_op_offload_min_batch() {
@@ -423,7 +431,15 @@ static ggml_cuda_device_info ggml_cuda_init() {
                 int can_access_peer;
                 CUDA_CHECK(cudaDeviceCanAccessPeer(&can_access_peer, id, id_other));
                 if (can_access_peer) {
-                    CUDA_CHECK(cudaDeviceEnablePeerAccess(id_other, 0));
+                    // the peer connection may already be enabled by an earlier context
+                    // (or a driver component); tolerate instead of aborting (A18)
+                    const cudaError_t err = cudaDeviceEnablePeerAccess(id_other, 0);
+                    if (err == cudaSuccess) {
+                        GGML_LOG_INFO("%s: enabled peer access between physical devices %d and %d\n", "ggml_cuda_init", id, id_other);
+                    } else {
+                        GGML_LOG_INFO("%s: peer access between physical devices %d and %d: %s\n", "ggml_cuda_init", id, id_other, cudaGetErrorString(err));
+                    }
+                    (void) cudaGetLastError();
                 }
             }
         }
