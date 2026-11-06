@@ -28,7 +28,9 @@
 #include <algorithm>
 #include <cassert>
 #include <cfloat>
+#include <climits>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <cmath>
 #include <functional>
@@ -1755,6 +1757,32 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         splits[i] = split_sum != 0.0f ? splits[i] / split_sum : float(i + 1) / n_devices();
     }
 
+    // A1: optional hybrid-aware placement, default off
+    int hybrid_attn_dev0 = -1; // -1: disabled, INT_MAX: all, >= 0: quota
+    if (const char * env = getenv("LLAMA_LAYER_SPLIT_HYBRID")) {
+        if (llm_arch_is_hybrid(arch) && n_devices() == 2) {
+            if (strcmp(env, "attn") == 0) {
+                hybrid_attn_dev0 = INT_MAX;
+            } else if (strncmp(env, "attn:", 5) == 0) {
+                hybrid_attn_dev0 = std::max(0, atoi(env + 5));
+            } else if (env[0] != '\0' && strcmp(env, "off") != 0) {
+                LLAMA_LOG_WARN("%s: ignoring unknown LLAMA_LAYER_SPLIT_HYBRID value '%s'\n", __func__, env);
+            }
+        } else {
+            LLAMA_LOG_WARN("%s: LLAMA_LAYER_SPLIT_HYBRID requires a hybrid arch and exactly 2 devices, ignored\n", __func__);
+        }
+    }
+    if (hybrid_attn_dev0 >= 0) {
+        if (!all_zero) {
+            LLAMA_LOG_WARN("%s: LLAMA_LAYER_SPLIT_HYBRID ignores tensor_split\n", __func__);
+        }
+        LLAMA_LOG_INFO("%s: hybrid layer split: up to %d full-attention layers on %s, remaining layers on %s\n",
+                __func__, hybrid_attn_dev0,
+                ggml_backend_dev_name(devices.at(0).dev),
+                ggml_backend_dev_name(devices.at(1).dev));
+    }
+    int n_attn_dev0 = 0;
+
     const int i_gpu_start = std::max(n_layer_all + 1 - n_gpu_layers, 0);
     const int act_gpu_layers = devices.empty() ? 0 : std::min(n_gpu_layers, n_layer_all + 1);
     auto get_layer_buft_list = [&](int il) -> llama_model::impl::layer_dev {
@@ -1762,6 +1790,17 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         if (il < i_gpu_start || (il - i_gpu_start) >= act_gpu_layers) {
             LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(cpu_dev), is_swa);
             return {cpu_dev, &pimpl->cpu_buft_list};
+        }
+        if (hybrid_attn_dev0 >= 0) {
+            const bool is_full_attn = il < (int) hparams.n_layer() && !hparams.is_recr(il);
+            size_t gpu = 1;
+            if (is_full_attn && n_attn_dev0 < hybrid_attn_dev0) {
+                gpu = 0;
+                ++n_attn_dev0;
+            }
+            auto * dev = devices.at(gpu).dev;
+            LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d (hybrid split)\n", il, ggml_backend_dev_name(dev), is_swa);
+            return {dev, &pimpl->gpu_buft_list.at(dev)};
         }
         const int layer_gpu = std::upper_bound(splits.begin(), splits.begin() + n_devices(), float(il - i_gpu_start)/act_gpu_layers) - splits.begin();
         auto * dev = devices.at(layer_gpu).dev;
