@@ -74,7 +74,14 @@ static constexpr size_t GGML_CUDA_AR_ARRIVAL_STRIDE = 64;
 // Number of blocks the chunked kernel launches with.  Each block stripes a
 // disjoint slice of the data and synchronizes through its own arrival-token
 // slot so multiple SMs can pump PCIe stores in parallel.
+// (Default; env GGML_CUDA_AR_KERNEL_BLOCKS can override, clamped 1..32.)
 static constexpr int GGML_CUDA_AR_KERNEL_BLOCKS = 8;
+
+// Default poll-delay in SM cycles between pre-Volta polling reads (clock()-based
+// fallback in the kernel; Volta+ always uses __nanosleep).
+// Env GGML_CUDA_AR_SPIN_CYCLES can override; 0 disables the throttle entirely,
+// any value up to 2^20 is accepted.
+static constexpr unsigned int GGML_CUDA_AR_SPIN_CYCLES_DEFAULT = 16384;
 
 // ---------------------------------------------------------------------------
 // Chunked kernel AllReduce -- 2 GPUs, supports float, half, and bfloat16.
@@ -113,9 +120,10 @@ static __global__ void ggml_cuda_ar_kernel(
         T_wire       * __restrict__ host_mine,
         const T_wire * __restrict__ host_other,
         int                         count,
-        int *                       arrival_mine,
-        int *                       arrival_other,
-        int                         token) {
+    int *       arrival_mine,
+    int *       arrival_other,
+    int         token,
+    unsigned int spin_cycles) {
 
     // Vector unit for the wire type, sized to the arch's widest single-instruction
     // copy (16 B on Volta+).  Each phase-1 iter writes one vector to host memory;
@@ -169,14 +177,14 @@ static __global__ void ggml_cuda_ar_kernel(
             __nanosleep(100);
 #else
             // Pascal (no __nanosleep): the volatile read above is itself a
-            // PCIe round-trip (~1.5-2.5 us), so an unthrottled spin from 8
+            // PCIe round-trip (~1.5-2.5 us), so an unthrottled spin from many
             // blocks would push tens to hundreds of MB/s of 64 B read TLPs
-            // over the same link carrying the reduction data.  Delay ~16k
-            // SM cycles (8-11 us at 1.5-2 GHz) between polls; the token's
-            // propagation latency (a few us) dominates, so the expected
-            // added latency per AR is half a poll interval.
+            // over the same link carrying the reduction data.  Delay spin_cycles
+            // SM cycles between polls (default 16384 = 8-11 us at 1.5-2 GHz);
+            // the token's propagation latency (a few us) dominates, so the
+            // expected added latency per AR is half a poll interval.
             const unsigned int spin_start = clock();
-            while (clock() - spin_start < 16384U) {
+            while (clock() - spin_start < spin_cycles) {
                 // delay
             }
 #endif // GGML_USE_HIP
@@ -318,6 +326,8 @@ struct ggml_cuda_ar_pipeline {
     size_t   copy_threshold;
     size_t   copy_chunk_bytes;
     size_t   bf16_threshold; // tensors >= this size (bytes) are reduced via FP32->BF16 round-trip; 0 disables
+    int      kernel_blocks;  // chunked kernel grid; env GGML_CUDA_AR_KERNEL_BLOCKS (default 8, clamp 1..32)
+    unsigned int spin_cycles; // pre-Volta poll throttle; env GGML_CUDA_AR_SPIN_CYCLES (default 16384; 0 = no throttle)
     uint64_t call_count;
 
     // Per-device resources.
@@ -351,7 +361,7 @@ struct ggml_cuda_ar_pipeline {
 // blockIdx.x * (ARRIVAL_STRIDE/sizeof(int)) internally to land on its own slot.
 static int * ggml_cuda_ar_arrival_ptr(const ggml_cuda_ar_pipeline * p, int slot, int rank) {
     const size_t offset = ((size_t)slot * p->n_devices + rank) *
-                          GGML_CUDA_AR_KERNEL_BLOCKS * GGML_CUDA_AR_ARRIVAL_STRIDE;
+                          (size_t)p->kernel_blocks * GGML_CUDA_AR_ARRIVAL_STRIDE;
     return reinterpret_cast<int *>(p->arrival.dev + offset);
 }
 
@@ -452,6 +462,24 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
     // ne).  Set GGML_CUDA_AR_BF16_THRESHOLD=0 to disable, or to a larger
     // byte threshold to opt out for small tensors.
     p->bf16_threshold   = ggml_cuda_ar_env_u64("GGML_CUDA_AR_BF16_THRESHOLD", 1);
+    // Chunked-kernel grid + pre-Volta poll throttle (Pascal latency/occupancy tuning).
+    {
+        uint64_t blocks = ggml_cuda_ar_env_u64("GGML_CUDA_AR_KERNEL_BLOCKS", GGML_CUDA_AR_KERNEL_BLOCKS);
+        if (blocks < 1)        { blocks = 1; }
+        if (blocks > 32) {
+            GGML_LOG_WARN("%s: GGML_CUDA_AR_KERNEL_BLOCKS=%llu above 32; clamping (arrival slot array would grow without bound)\n",
+                          __func__, (unsigned long long) blocks);
+            blocks = 32;
+        }
+        p->kernel_blocks = (int) blocks;
+        uint64_t spin    = ggml_cuda_ar_env_u64("GGML_CUDA_AR_SPIN_CYCLES", GGML_CUDA_AR_SPIN_CYCLES_DEFAULT);
+        if (spin > (1u << 20)) {
+            GGML_LOG_WARN("%s: GGML_CUDA_AR_SPIN_CYCLES=%llu above 2^20; clamping\n",
+                          __func__, (unsigned long long) spin);
+            spin = 1u << 20;
+        }
+        p->spin_cycles = (unsigned int) spin;
+    }
     for (size_t i = 0; i < n_devices; ++i) {
         p->devices[i] = devices[i];
     }
@@ -502,7 +530,7 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
     // Arrival ring: cache-line padded so each GPU's int is on its own line.
     const size_t arrival_bytes =
         (size_t)GGML_CUDA_AR_POOL_SIZE * n_devices *
-        GGML_CUDA_AR_KERNEL_BLOCKS * GGML_CUDA_AR_ARRIVAL_STRIDE;
+        (size_t)p->kernel_blocks * GGML_CUDA_AR_ARRIVAL_STRIDE;
     if (p->arrival.alloc(arrival_bytes) != cudaSuccess) {
         GGML_LOG_ERROR("%s: alloc for arrival ring failed (%zu bytes)\n",
                        __func__, arrival_bytes);
@@ -941,7 +969,7 @@ bool ggml_cuda_ar_allreduce(
                 }
 
 #define LAUNCH_AR_KERNEL(T_dst, T_wire) \
-                ggml_cuda_ar_kernel<T_dst, T_wire><<<dim3(GGML_CUDA_AR_KERNEL_BLOCKS), dim3(256), 0, stream>>>( \
+                ggml_cuda_ar_kernel<T_dst, T_wire><<<dim3(p->kernel_blocks), dim3(256), 0, stream>>>( \
                     reinterpret_cast<const T_dst *>(data), \
                     reinterpret_cast<T_dst *>(data), \
                     reinterpret_cast<T_wire *>(p->host_buf[i].dev + (size_t) slot * p->buf_bytes), \
@@ -949,7 +977,8 @@ bool ggml_cuda_ar_allreduce(
                     static_cast<int>(chunk_elems), \
                     ggml_cuda_ar_arrival_ptr(p, slot, i), \
                     ggml_cuda_ar_arrival_ptr(p, slot, peer), \
-                    token)
+                    token, \
+                    p->spin_cycles)
 
                 if (use_bf16) {
                     GGML_ASSERT(input_type == GGML_TYPE_F32);
