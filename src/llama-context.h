@@ -445,6 +445,14 @@ private:
     ggml_backend_event_ptr ev_layer_inp_read;
     bool ev_layer_inp_read_recorded = false;
 
+    // per-backend ubatch fences (A4): recorded after each pipeline-parallel ubatch's
+    // async compute is enqueued, waited on before the next ubatch's set_inputs runs
+    struct ubatch_fence {
+        ggml_backend_t         backend = nullptr;
+        ggml_backend_event_ptr event;   // null when the backend does not support events
+    };
+    std::vector<ubatch_fence> ev_ubatch_fences;
+
     // keep copies of the per-sequence memory on the device
     std::map<llama_seq_id, llama_memory_buffers> mem_storage;
 
