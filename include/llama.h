@@ -337,6 +337,11 @@ extern "C" {
         // proportion of the model (layers or rows) to offload to each GPU, size: llama_max_devices()
         const float * tensor_split;
 
+        // hybrid attention layer placement across two devices (hybrid-recurrent archs only).
+        // NULL (default) leaves the placement unset; "attn" places all full-attention layers on
+        // device 0; "attn:N" places the first N full-attention layers there. requires exactly 2 devices.
+        const char * hybrid_attn;
+
         // Called with a progress value between 0.0 and 1.0. Pass NULL to disable.
         // If the provided progress_callback returns true, model loading continues.
         // If it returns false, model loading is immediately aborted.

@@ -1757,24 +1757,26 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         splits[i] = split_sum != 0.0f ? splits[i] / split_sum : float(i + 1) / n_devices();
     }
 
-    // A1: optional hybrid-aware placement, default off
+    // A1: optional hybrid-aware placement, default off.
+    // precedence: --layer-split-hybrid (LLAMA_ARG_LAYER_SPLIT_HYBRID) > legacy LLAMA_LAYER_SPLIT_HYBRID env
     int hybrid_attn_dev0 = -1; // -1: disabled, INT_MAX: all, >= 0: quota
-    if (const char * env = getenv("LLAMA_LAYER_SPLIT_HYBRID")) {
+    const char * hybrid_place = params.hybrid_attn ? params.hybrid_attn : getenv("LLAMA_LAYER_SPLIT_HYBRID");
+    if (hybrid_place) {
         if (llm_arch_is_hybrid(arch) && n_devices() == 2) {
-            if (strcmp(env, "attn") == 0) {
+            if (strcmp(hybrid_place, "attn") == 0) {
                 hybrid_attn_dev0 = INT_MAX;
-            } else if (strncmp(env, "attn:", 5) == 0) {
-                hybrid_attn_dev0 = std::max(0, atoi(env + 5));
-            } else if (env[0] != '\0' && strcmp(env, "off") != 0) {
-                LLAMA_LOG_WARN("%s: ignoring unknown LLAMA_LAYER_SPLIT_HYBRID value '%s'\n", __func__, env);
+            } else if (strncmp(hybrid_place, "attn:", 5) == 0) {
+                hybrid_attn_dev0 = std::max(0, atoi(hybrid_place + 5));
+            } else if (hybrid_place[0] != '\0' && strcmp(hybrid_place, "off") != 0) {
+                LLAMA_LOG_WARN("%s: ignoring unknown hybrid attention placement value '%s'\n", __func__, hybrid_place);
             }
         } else {
-            LLAMA_LOG_WARN("%s: LLAMA_LAYER_SPLIT_HYBRID requires a hybrid arch and exactly 2 devices, ignored\n", __func__);
+            LLAMA_LOG_WARN("%s: hybrid attention placement requires a hybrid arch and exactly 2 devices, ignored\n", __func__);
         }
     }
     if (hybrid_attn_dev0 >= 0) {
         if (!all_zero) {
-            LLAMA_LOG_WARN("%s: LLAMA_LAYER_SPLIT_HYBRID ignores tensor_split\n", __func__);
+            LLAMA_LOG_WARN("%s: hybrid attention placement ignores tensor_split\n", __func__);
         }
         LLAMA_LOG_INFO("%s: hybrid layer split: up to %d full-attention layers on %s, remaining layers on %s\n",
                 __func__, hybrid_attn_dev0,
@@ -3525,6 +3527,7 @@ llama_model_params llama_model_default_params() {
         /*.lazy_mode                   =*/ LLAMA_LAZY_MODE_AUTO,
         /*.main_gpu                    =*/ 0,
         /*.tensor_split                =*/ nullptr,
+        /*.hybrid_attn                 =*/ nullptr,
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
