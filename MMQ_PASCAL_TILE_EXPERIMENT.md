@@ -6,8 +6,8 @@ Status: rejected; the change was reverted. Only the one-shot MMQ config log
 ## Context
 
 The one-shot MMQ config log added in `pre-a1` was used to capture the
-effective config of the Pascal device (cc 6.1, GP102-class) on the target
-workload:
+effective config of the Tesla P40 (cc 6.1, GP102) on the target workload,
+Qwen3.8-27B (Q6_K):
 
 - `Q6_K`: `J=64 I=64 nthreads=256 sram=27432 fallback=0`
 - `Q8_0`: `J=64 I=64 nthreads=256 sram=28224`
@@ -31,14 +31,14 @@ Single-file edit to `ggml/src/ggml-cuda/mmq-config-pascal-dp4a.cuh`: the
 fourth `CASE` argument (`I`) was changed from 64 to 32 on all Q6_K and Q8_0
 rows, both fallback groups. `nthreads`, `occupancy`, `J`, shared-memory
 layout, and `K_vram` were left unchanged, as were all other quant types and
-the Ampere table (Ampere devices were unaffected).
+the RTX 3080's Ampere table (it was unaffected).
 
 The table is defined once as `__host__ __device__` and is used by both host
 dispatch and device dispatch, so host-side shared-memory/grid math and the
 kernel's compile-time tiling stay consistent. The user rebuilt and
 restarted the live server; the post-rebuild run confirmed the new config was
-active (`I=32`, `sram=18452/18848` on the Pascal device) and the Ampere
-config was unchanged.
+active (`I=32`, `sram=18452/18848` on the Tesla P40) and the RTX 3080 config
+was unchanged.
 
 ## Result
 

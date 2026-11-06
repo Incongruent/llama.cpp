@@ -3,8 +3,8 @@
 This fork carries a small, self-contained set of changes for running large
 quantized models across two GPUs of *different generations* over plain PCIe:
 
-- one 10 GB Ampere-class device (compute capability 8.6),
-- one 24 GB Pascal GP102-class device (compute capability 6.1),
+- an NVIDIA RTX 3080 (10 GB, compute capability 8.6),
+- an NVIDIA Tesla P40 (24 GB, compute capability 6.1),
 - no NVLink/NVSwitch, no peer-to-peer memory access between the two.
 
 The upstream multi-GPU paths assume reasonably homogeneous, modern hardware.
@@ -13,8 +13,10 @@ add one placement knob for hybrid-attention models, and vectorize a hot
 K-quant to f16 conversion path. Every change is opt-in or behavior-preserving
 by default, and each is its own commit so it can be dropped independently.
 
-Target workload: a ~27B-parameter hybrid-attention model quantized with
-Q6_K/Q5_K tensors, tensor-split across both devices.
+Target workload: Qwen3.8-27B (hybrid attention, ~27B parameters) quantized
+with Q6_K/Q5_K tensors, tensor-split across both devices. The changes are
+generation-agnostic; the names above are the configuration this fork was
+developed and measured on.
 
 ## Branch layout
 

@@ -1,8 +1,9 @@
 # llama.cpp
 
 > [!NOTE]
-> **Fork:** this branch adds mixed-generation multi-GPU support (Ampere + Pascal-class devices over PCIe).
-> See [FORK.md](FORK.md) for the intent, the pre-A1 and A1–A4 changes, and performance notes.
+> **Fork intent:** run large quantized LLMs on a mixed-generation pair — an NVIDIA RTX 3080 (10 GB, sm_86) and a Tesla P40 (24 GB, sm_61) over PCIe, with no NVLink/P2P — using hybrid-attention models such as Qwen3.8-27B at Q6_K/Q5_K.
+> Adds Pascal internal AllReduce support, hybrid-attention layer placement, tolerant P2P setup, vectorized K-quant to f16 dequantization, and per-backend pipeline-parallel fences.
+> See [FORK.md](FORK.md) for details and performance notes.
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
 
