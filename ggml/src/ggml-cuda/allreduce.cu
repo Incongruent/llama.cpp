@@ -6,6 +6,7 @@
 #include "ggml-impl.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -374,6 +375,38 @@ static uint64_t ggml_cuda_ar_env_u64(const char * name, uint64_t default_value) 
     char * end = nullptr;
     const unsigned long long parsed = strtoull(value, &end, 10);
     return end != value ? (uint64_t) parsed : default_value;
+}
+
+static bool ggml_cuda_ar_env_flag(const char * name, bool default_value) {
+    return ggml_cuda_ar_env_u64(name, default_value ? 1 : 0) != 0;
+}
+
+// A12: CUDA graph capture safety guard.  The AR pipeline synchronizes through
+// cross-stream events and busy-wait kernels; none of that is representable in
+// a captured graph (replay would bake in event state / poll tokens).  AR is
+// dispatched between per-device graph computations (ggml_backend_meta_eval),
+// so today this guard should never fire, but if a refactor ever ends up
+// invoking AR while a participating stream is capturing, bail out with a
+// warn-once and let the caller's plain-copy fallback handle the reduction.
+// Default on; GGML_CUDA_AR_GRAPH_GUARD=0 disables (diagnostics only).
+static std::atomic<bool> ggml_cuda_ar_capture_warned{false};
+
+static bool ggml_cuda_ar_capture_guard(ggml_backend_cuda_context ** ctxs, int n) {
+    if (!ggml_cuda_ar_env_flag("GGML_CUDA_AR_GRAPH_GUARD", true)) {
+        return true;
+    }
+    for (int i = 0; i < n; ++i) {
+        cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+        if (cudaStreamIsCapturing(ctxs[i]->stream(), &status) != cudaSuccess ||
+                status != cudaStreamCaptureStatusNone) {
+            if (!ggml_cuda_ar_capture_warned.exchange(true)) {
+                GGML_LOG_WARN("%s: device context %d's stream is capturing, skipping internal allreduce" \
+                              " (caller must fall back to plain copies)\n", __func__, i);
+            }
+            return false;
+        }
+    }
+    return true;
 }
 
 struct ggml_cuda_ar_slot_info {
@@ -800,6 +833,18 @@ bool ggml_cuda_ar_allreduce(
 
     const int n = p->n_devices;
     GGML_ASSERT(n == 2);
+
+    // A12: refuse to run under stream capture before touching any AR state
+    // (see ggml_cuda_ar_capture_guard above).
+    {
+        ggml_backend_cuda_context * ctxs[GGML_CUDA_MAX_DEVICES];
+        for (int i = 0; i < n; ++i) {
+            ctxs[i] = static_cast<ggml_backend_cuda_context *>(backends[i]->context);
+        }
+        if (!ggml_cuda_ar_capture_guard(ctxs, n)) {
+            return false;
+        }
+    }
 
     const ggml_type input_type = tensors[0]->type;
     GGML_ASSERT(input_type == GGML_TYPE_F32 || input_type == GGML_TYPE_F16 || input_type == GGML_TYPE_BF16);
