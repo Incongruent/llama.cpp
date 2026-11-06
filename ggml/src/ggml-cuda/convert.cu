@@ -204,6 +204,99 @@ static __global__ void dequantize_block_q5_1_f16(const void * __restrict__ vx, h
     ((half2 *)(yb + 16))[1] = __floats2half2_rn(hi[2], hi[3]);
 }
 
+// A3: dedicated half2-vectorized f16 K-quant kernels (Q4_K/Q5_K/Q6_K). Each thread
+// dequantizes two adjacent elements of the super-block so every store is a 32-bit
+// half2 write, with the same float math and op order as the generic 32/64-thread
+// helpers in dequantize.cuh.
+
+static __global__ void dequantize_block_q4_K_f16(const void * __restrict__ vx, half * __restrict__ y) {
+    const int64_t j = 2*threadIdx.x;
+
+    const block_q4_K * x = (const block_q4_K *) vx + blockIdx.x;
+
+    const float dall = __low2half(x->dm);
+    const float dmin = __high2half(x->dm);
+
+    float v[2];
+#pragma unroll
+    for (int p = 0; p < 2; ++p) {
+        const int64_t je   = j + p;
+        const int64_t jib  = je >> 6;         // 0...3
+        const int64_t side = (je & 63) >> 5;  // 0: lo nibble, 1: hi nibble
+        const int64_t ir   = (je & 31) >> 2;  // 0...7
+        const int64_t l    = je & 3;
+
+        const uint8_t q = x->qs[32*jib + 4*ir + l];
+
+        uint8_t sc, m;
+        get_scale_min_k4(2*jib + side, x->scales, sc, m);
+        const float d1 = dall * sc;
+        const float m1 = dmin * m;
+
+        v[p] = d1 * (float)(side == 0 ? (q & 0xF) : (q >> 4)) - m1;
+    }
+
+    ((half2 *)(y + QK_K*blockIdx.x + j))[0] = __floats2half2_rn(v[0], v[1]);
+}
+
+static __global__ void dequantize_block_q5_K_f16(const void * __restrict__ vx, half * __restrict__ y) {
+    const int64_t j = 2*threadIdx.x;
+
+    const block_q5_K * x = (const block_q5_K *) vx + blockIdx.x;
+
+    const float dall = __low2half(x->dm);
+    const float dmin = __high2half(x->dm);
+
+    float v[2];
+#pragma unroll
+    for (int p = 0; p < 2; ++p) {
+        const int64_t je   = j + p;
+        const int64_t jib  = je >> 6;         // 0...3
+        const int64_t side = (je & 63) >> 5;  // 0: lo nibble, 1: hi nibble
+        const int64_t ir   = (je & 31) >> 1;  // 0...15
+        const int64_t odd  = je & 1;
+
+        const uint8_t ql = x->qs[32*jib + 2*ir + odd];
+        const uint8_t qh = x->qh[2*ir + odd];
+        const uint8_t hm = 1U << (2*jib + side);
+
+        uint8_t sc, m;
+        get_scale_min_k4(2*jib + side, x->scales, sc, m);
+        const float d1 = dall * sc;
+        const float m1 = dmin * m;
+
+        const int nib = (side == 0 ? (ql & 0xF) : (ql >> 4)) + (qh & hm ? 16 : 0);
+        v[p] = d1 * (float) nib - m1;
+    }
+
+    ((half2 *)(y + QK_K*blockIdx.x + j))[0] = __floats2half2_rn(v[0], v[1]);
+}
+
+static __global__ void dequantize_block_q6_K_f16(const void * __restrict__ vx, half * __restrict__ y) {
+    const int64_t j = 2*threadIdx.x;
+
+    const block_q6_K * x = (const block_q6_K *) vx + blockIdx.x;
+
+    const float d = x->d;
+
+    float v[2];
+#pragma unroll
+    for (int p = 0; p < 2; ++p) {
+        const int64_t je = j + p;
+        const int64_t ip = je >> 7;           // 0 or 1
+        const int64_t k  = (je & 127) >> 5;   // 0...3
+        const int64_t il = je & 31;           // 0...31
+
+        const uint8_t ql = x->ql[64*ip + il + 32*(k & 1)];
+        const int nib = (k >= 2 ? (ql >> 4) : (ql & 0xF)) | (((x->qh[32*ip + il] >> (2*k)) & 3) << 4);
+        const float q6 = (float)((int8_t) nib - 32);
+
+        v[p] = (d * (float) x->scales[8*ip + il/16 + 2*k]) * q6;
+    }
+
+    ((half2 *)(y + QK_K*blockIdx.x + j))[0] = __floats2half2_rn(v[0], v[1]);
+}
+
 template<typename dst_t>
 static __global__ void dequantize_block_q4_1(const void * __restrict__ vx, dst_t * __restrict__ yy, int nb32) {
 
@@ -409,6 +502,20 @@ static void dequantize_block_q5_1_f16_cuda(const void * vx, half * y, const int6
     const int nb32 = k / 32;
     const int nb = (k + 255) / 256;
     dequantize_block_q5_1_f16<<<nb, 32, 0, stream>>>(vx, y, nb32);
+}
+
+// A3: launchers for the vectorized q4_K/q5_K/q6_K -> f16 kernels.
+static void dequantize_block_q4_K_f16_cuda(const void * vx, half * y, const int64_t k, cudaStream_t stream) {
+    const int nb = k / QK_K;
+    dequantize_block_q4_K_f16<<<nb, 128, 0, stream>>>(vx, y);
+}
+static void dequantize_block_q5_K_f16_cuda(const void * vx, half * y, const int64_t k, cudaStream_t stream) {
+    const int nb = k / QK_K;
+    dequantize_block_q5_K_f16<<<nb, 128, 0, stream>>>(vx, y);
+}
+static void dequantize_block_q6_K_f16_cuda(const void * vx, half * y, const int64_t k, cudaStream_t stream) {
+    const int nb = k / QK_K;
+    dequantize_block_q6_K_f16<<<nb, 128, 0, stream>>>(vx, y);
 }
 
 template<typename dst_t>
@@ -703,10 +810,19 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
         case GGML_TYPE_Q3_K:
             return dequantize_row_q3_K_cuda;
         case GGML_TYPE_Q4_K:
+            if (fp16_available(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
+                return dequantize_block_q4_K_f16_cuda; // #27109 fix
+            }
             return dequantize_row_q4_K_cuda;
         case GGML_TYPE_Q5_K:
+            if (fp16_available(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
+                return dequantize_block_q5_K_f16_cuda; // #27109 fix
+            }
             return dequantize_row_q5_K_cuda;
         case GGML_TYPE_Q6_K:
+            if (fp16_available(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
+                return dequantize_block_q6_K_f16_cuda; // #27109 fix
+            }
             return dequantize_row_q6_K_cuda;
         case GGML_TYPE_IQ2_XXS:
             return dequantize_row_iq2_xxs_cuda;
