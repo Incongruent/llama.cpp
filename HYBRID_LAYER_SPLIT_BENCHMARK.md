@@ -108,6 +108,30 @@ through `ggml_backend_buffer` when an allocation returns null, instead of
 taking the graceful error path that the larger quotas hit. A guard there
 would turn a GGML abort into a clean `failed to allocate` message.
 
+## Why `--override-tensor` cannot replace A1
+
+An obvious alternative is per-tensor placement with `--override-tensor`
+(`-ot`), pinning the first twelve attention blocks to device 0 by name.
+It does not work, measured:
+
+- `-ot` relocates **weight tensors only** (rules are first-match-wins,
+  scoped to tensor names). The layer→device map (`dev_layer`) that drives
+  KV-cache placement, recurrent-state placement, and graph scheduling is
+  computed from `--tensor-split` and is not consulted by `-ot`.
+- With the model's 16 full-attention blocks at stride 4
+  (3, 7, 11, …, 63) and `-ot` rules for the first twelve,
+  the load produced a contradictory layout — attention weights pinned to
+  device 0 while the same layers' KV stayed on the contiguous
+  0.22-split head, and several recurrent layers' states on device 0
+  under weights pinned to device 1 — and the process **aborted during
+  memory init** before serving.
+- Even without the abort, weights and cache for the same layer would sit
+  on different cards; A1's value is precisely co-location (weight, KV,
+  and schedule move together), which no `-ot` scheme expresses today.
+
+This is the mechanism argument for A1 against the "just use
+`--override-tensor`" review objection.
+
 ## Attribution across A1–A4
 
 The speedup is attributable to A1; the other changes are neutral or
