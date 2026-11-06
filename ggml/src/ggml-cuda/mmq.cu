@@ -4,6 +4,7 @@
 #include "mmid.cuh"
 
 #include <cstdint>
+#include <set>
 
 static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream, const ggml_prec prec_src1) {
     switch (args.type_x) {
@@ -250,6 +251,23 @@ void ggml_cuda_mul_mat_q(
         J_best = ggml_cuda_mmq_get_J_best(src0->type, ncols_opt, fallback, cc, smpbo, prec_src1, &nthreads_best);
     }
     GGML_ASSERT(J_best > 0);
+
+    {
+        static std::set<uint32_t> logged;
+        uint32_t key = (uint32_t) (cc * 100003u + (uint32_t) src0->type);
+        key = key * 131u + (uint32_t) J_best;
+        key = key * 2u + (fallback ? 1u : 0u);
+        key = key * 2u + (gate ? 1u : 0u);
+        if (logged.insert(key).second) {
+            const ggml_cuda_mmq_config cfg = ggml_cuda_mmq_get_config(src0->type, J_best, fallback, cc, prec_src1);
+            GGML_LOG_DEBUG("ggml_cuda: [MMQ] dev %d cc %d %s ne01=%ld ne11=%ld J=%d I=%d nthreads=%d sram=%zu smpbo=%zu fallback=%d fusion=%d\n",
+                           id, cc, ggml_type_name(src0->type),
+                           (long) ne01, (long) ne11,
+                           J_best, cfg.I, nthreads_best,
+                           mmq_get_nbytes_shared(cfg, cc), smpbo,
+                           fallback ? 1 : 0, gate ? 1 : 0);
+        }
+    }
 
     // A tile of size J can read in at most J - 1 extra columns.
     // For simplicity, round up the padding of a full tile to a multiple of the number of bytes that nthreads can load in parallel.
