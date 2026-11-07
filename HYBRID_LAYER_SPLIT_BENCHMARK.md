@@ -238,3 +238,39 @@ server numbers' order: a16 12.84/13.13 t/s vs a15 12.58/11.19 t/s (2 reps each).
   at ub 256 vs ~8576 allocatable); only a KV-type reduction (e.g. q5/q4 KV)
   or a smaller ctx would close that.
 
+## A1rig replay (2026-11-07): the original one-shot benchmark re-run on the current build
+
+The original A/B (status header, above) was one leg of a fixed 358k-char
+C++-source prompt (~100,490 tokens), `n_predict 512`, temp 0 / seed 42 /
+top_k 1, one-shot per fresh server start. Those exact assets were replayed
+on the current build for the three placement candidates. Fees: attn:15 runs
+the exact original shape (105000, ub 1024); attn:16 must drop to ctx 103000
+/ ub 256, the only fitting shape large enough for the original prompt
+(100,490 + 512 <= 103,168 cells). Single rep per leg.
+
+| leg | shape | PP tok/s | TG tok/s | total wall | vs rerun attn:12 |
+| --- | --- | --- | --- | --- | --- |
+| attn:12 (rerun, current build) | 105000, ub 1024, draft+head dev0 | 168.34 | 17.12 | 626.9 s | — |
+| attn:15 | 105000, ub 1024, draft+head dev1 | **217.27** | 16.88 | **492.9 s** | PP +29.1%, TG −1.4%, wall **−21.4%** |
+| attn:16 | 103000→103,168, ub 256, draft+head dev1 | 144.05 | **19.09** | 724.4 s | PP −14.4%, TG **+11.5%**, wall +15.6% |
+
+Reference: the original build's attn:12 leg measured PP 182.83 / TG 16.23;
+the rerun reproduces TG above that (+5.5%) while PP is ~8% lower — build
+drift from A5–A16, not placement, since both PP and TG of subsequent legs
+move in directions the old build did not show. Notably the old high-TG
+regime survives on the current build (17–19 t/s): the low TG values in the
+90%-fill sweep above were prompt/content-dependent, not a placement
+property.
+
+Venue conclusions:
+
+- **attn:15 is the composite winner at equal context**: +29% prefill with
+  decode within noise of the prod shape, total wall −21.4%. It needs no
+  concession (full 105000 ctx, ub 1024 unchanged).
+- **attn:16 is the decode winner (+11.5% TG)** but loses this specific
+  long-prefill workload on wall time, because fitting its KV forces ub 256
+  (4× more prefill micro-batches). If the real usage is many short prefills
+  / long multi-turn decode, the decode edge can dominate instead.
+- PP across legs is ubatch-confounded for attn:16; the only controlled
+  comparison (attn:12 vs attn:15, both ub 1024) shows pure placement gains.
+
