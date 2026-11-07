@@ -39,6 +39,7 @@ identical output. Companion docs:
 
 | # | placement (only variables changed) | context / ub | PP tok/s | TG tok/s | MTP acc | delta vs baseline row |
 | --- | --- | --- | --- | --- | --- | --- |
+| 0a | vanilla (no placement args at all: no hybrid, no ts, no overrides, default free-memory split) | 105216/1024 | 144.0 | 6.37 / 6.64 (2 reps) | 0.246 / 0.271 | measured control on the current build |
 | 0 | pre-hybrid orientation (ts 0.22, top/output on fast GPU, hybrid off) | 105216/1024 | 147.2 | 6.74 | 0.288 | from the ts-sweep measurement on this build |
 | 1 | attn:12 quota + draft tower + output head on fast GPU (long-standing production) | 105216/1024 | 184.5 | 8.34 | 0.278 | reference row |
 | 2 | attn:15 + draft & head on slow GPU | 105216/1024 | 217.8 | 8.91 | 0.294 | PP +18.1 %, TG +6.8 % |
@@ -51,6 +52,7 @@ identical output. Companion docs:
 
 | leg | shape | PP tok/s | TG tok/s | wall |
 | --- | --- | --- | --- | --- |
+| vanilla control (current build, no placement args) | 105216/1024 | 147.30 | 13.03 | 721.5 s |
 | off / ts orientation (historical build) | 105216/1024 | 135.88 | 13.17 | 778.4 s |
 | attn:12, draft+head fast GPU (long-standing production) | 105216/1024 | 182.83 | 16.23 | 581.1 s |
 | attn:12 (current build, rerun control) | 105216/1024 | 168.34 | 17.12 | 626.9 s |
@@ -59,8 +61,14 @@ identical output. Companion docs:
 | **attn:16 + vision slow GPU (recommended)** | **105216/1024** | **232.54** | **18.05** | **460.5 s** |
 
 Recommended-row vs production-row deltas (same rig, same build):
-**PP +38.1 %, TG +5.4 %, wall −26.6 %**; vs the pre-hybrid orientation the
-recommended config is **PP +71 %, TG +37 %** (fill-rig column #0).
+**PP +38.1 %, TG +5.4 %, wall −26.6 %**. Against the genuine vanilla
+configuration (current build, zero placement arguments, A-rig):
+**PP +57.9 % (147.30 → 232.54), TG +38.5 % (13.03 → 18.05),
+wall −36.2 % (721.5 s → 460.5 s)**; on the fill rig vs vanilla:
+**PP +63 %, TG ~+43 %**. The vanilla default split reproduces the
+historical ts-only orientation rows (147.3/13.0 one-shot vs 135.9/13.2
+historical; 144.0/6.5 fill vs 147.2/6.74), so the old-orientation numbers
+remain valid baselines and the placement deltas stack on them.
 
 ## Fit bookkeeping (why the ceilings moved)
 

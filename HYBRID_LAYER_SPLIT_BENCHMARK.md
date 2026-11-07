@@ -250,9 +250,11 @@ the exact original shape (105000, ub 1024); attn:16 must drop to ctx 103000
 
 | leg | shape | PP tok/s | TG tok/s | total wall | vs rerun attn:12 |
 | --- | --- | --- | --- | --- | --- |
+| vanilla control (current build, no placement args: no hybrid env, no ts, no overrides, no mmproj-device) | 105000, ub 1024 | 147.30 | 13.03 | 721.5 s | −12.5% / −23.9% |
 | attn:12 (rerun, current build) | 105000, ub 1024, draft+head dev0 | 168.34 | 17.12 | 626.9 s | — |
 | attn:15 | 105000, ub 1024, draft+head dev1 | **217.27** | 16.88 | **492.9 s** | PP +29.1%, TG −1.4%, wall **−21.4%** |
 | attn:16 | 103000→103,168, ub 256, draft+head dev1 | 144.05 | **19.09** | 724.4 s | PP −14.4%, TG **+11.5%**, wall +15.6% |
+| attn:16 + vision on dev1 | 105000→105,216, ub 1024, draft+head+mmproj dev1 | 232.54 | 18.05 | **460.5 s** | PP **+38.1%**, TG +5.4%, wall **−26.6%** |
 
 Reference: the original build's attn:12 leg measured PP 182.83 / TG 16.23;
 the rerun reproduces TG above that (+5.5%) while PP is ~8% lower — build
@@ -300,7 +302,9 @@ Performance:
 | 90% fill | attn:16 + mmproj CUDA1, ub 2048 | 210.2 | 9.94 | 0.286 |
 | 90% fill | attn:15 (mmproj on CUDA0), ub 1024 | 217.8 | 8.91 | 0.294 |
 | 90% fill | attn:12 prod shape (mmproj on CUDA0), ub 1024 | 184.5 | 8.34 | 0.278 |
+| 90% fill | vanilla (current build, no placement args, default free-memory split) | 144.0 | 6.37 / 6.64 (2 reps) | 0.246 / 0.271 |
 | original one-shot rig (100,490 tok, n=512) | attn:16 + mmproj CUDA1, ub 1024 | **232.54** | 18.05 | 460.5 s wall |
+| original one-shot rig | vanilla control (no placement args) | 147.30 | 13.03 | 721.5 s wall |
 | original one-shot rig | attn:15, ub 1024 | 217.27 | 16.88 | 492.9 s wall |
 | original one-shot rig | attn:12 prod shape, ub 1024 | 168.34 | 17.12 | 626.9 s wall |
 
@@ -323,5 +327,8 @@ Updated standing recommendation (fast device = 10 GB card):
 
 vs the attn:12 production shape: PP +27.6% (fill) / +38.1% (one-shot),
 TG +11.4% (fill) / +5.4% (one-shot), one-shot wall −26.6%, full original
-context retained, and the vision tower moves off the fast device.
+context retained, and the vision tower moves off the fast device. Against
+the true vanilla configuration (no placement arguments, current build) the
+gains are PP +63% / TG ~+43% (fill, two reps) and PP +57.9% / TG +38.5% /
+wall −36.2% (one-shot).
 
