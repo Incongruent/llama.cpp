@@ -22,6 +22,12 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# Normalize: "61,86" (single string), 61;86 or a real array all become ['61','86'].
+# PS binds -Expected 61,86 as one literal string element of a string[] param.
+$expList = @()
+foreach ($item in $Expected) { $expList += @(($item -split '[,;:\s]+' | Where-Object { $_ })) }
+$Expected = @($expList | Where-Object { $_ })
+
 if (-not $Binary) {
     Write-Error "check-arch.ps1: -Binary is required (e.g. build\bin\ggml-cuda.dll)"
     exit 2
