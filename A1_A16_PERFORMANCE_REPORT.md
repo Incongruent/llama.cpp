@@ -8,6 +8,35 @@ identical output. Companion docs:
 [HYBRID_LAYER_SPLIT_BENCHMARK.md](HYBRID_LAYER_SPLIT_BENCHMARK.md),
 [FORK.md](FORK.md).
 
+## Headline: gains over the vanilla run (current build, zero placement arguments)
+
+The vanilla control runs the same binaries with no placement tuning of any
+kind (no quota, no tensor-split, no per-tensor overrides, default
+allocation by free memory). Every row below is the same model, context,
+batch, and speculative settings; only placement configuration changes.
+
+Fill rig (90 % of context as prompt, n_predict 512, spec on):
+
+| placement | PP tok/s | TG tok/s | vs vanilla |
+| --- | --- | --- | --- |
+| vanilla (no placement args) | 144.0 | 6.37–6.64 | — |
+| legacy production (attn:12, draft+head on fast GPU) | 184.5 | 8.34 | PP +28 %, TG +28 % |
+| attn:15 + draft/head/vision on slow GPU | 217.8 | 8.91 | PP +51 %, TG +37 % |
+| **adopted: attn:16 + draft/head/vision on slow GPU, full context** | **235.4** | **9.29** | **PP +63 %, TG +43 %** |
+
+One-shot rig (100,490-token single prompt, n_predict 512, fresh server):
+
+| placement | PP tok/s | TG tok/s | wall | vs vanilla |
+| --- | --- | --- | --- | --- |
+| vanilla (no placement args) | 147.30 | 13.03 | 721.5 s | — |
+| legacy production (attn:12, draft+head on fast GPU) | 168.34 | 17.12 | 626.9 s | PP +14 %, TG +31 %, wall −13 % |
+| **adopted: attn:16 + draft/head/vision on slow GPU** | **232.54** | **18.05** | **460.5 s** | **PP +58 %, TG +38 %, wall −36 %** |
+
+The vanilla default split reproduces the pre-campaign orientation numbers
+(fill 144.0/6.5 vs 147.2/6.74; one-shot 147.3/13.0 vs historical 135.9/13.2),
+so these deltas represent the whole placement campaign against a stable
+baseline.
+
 ## Rig and workload
 
 - Devices: NVIDIA RTX 3080 (10 GB, cc 8.6, fast) + Tesla P40 (24 GB, cc 6.1),
