@@ -793,7 +793,11 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         key = key * 131u + (uint32_t) V->type;
         if (logged.insert(key).second) {
             const int cc = ggml_cuda_info().devices[device].cc;
-            GGML_LOG_DEBUG("ggml_cuda: [FA] dev %d cc %d kernel %s Q[%ld,%ld] kv %s/%s ne10=%ld ne11=%ld gqa=%ld\n",
+            // LOG_INFO (not DEBUG): llama-server -lv 4 does not surface
+            // LOG_DEBUG domain lines on this build, and the audit is meant to
+            // be read from normal bench/prod logs; it is one-shot, so the
+            // INFO volume is negligible.
+            GGML_LOG_INFO("ggml_cuda: [FA] dev %d cc %d kernel %s Q[%ld,%ld] kv %s/%s ne10=%ld ne11=%ld gqa=%ld\n",
                            device, cc, ggml_cuda_fattn_kernel_name(kernel),
                            (long) Q->ne[0], (long) Q->ne[1],
                            ggml_type_name(K->type), ggml_type_name(V->type),
