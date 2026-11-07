@@ -274,3 +274,54 @@ Venue conclusions:
 - PP across legs is ubatch-confounded for attn:16; the only controlled
   comparison (attn:12 vs attn:15, both ub 1024) shows pure placement gains.
 
+## mmproj-device offload (2026-11-07): freeing the vision tower from the fast GPU
+
+The mmproj (vision tower + projector) is resident on the fast device
+by default (`clip_ctx: CLIP using CUDA0 backend`) and its
+worst-case memory footprint is logged at load: **1157.64 MiB**. That
+footprint is part of what forced the earlier fit compromises: the
+attn:16 quota at ctx 105216 / ub 1024 failed while the mmproj sat on
+device 0 (failed KV-extend retry), and moving the vision tower to
+device 1 with `--mmproj-device CUDA1` removed exactly that failure.
+
+Fit outcomes (attn:16, draft+output on device 1, privileged to use the
+same 994.63 MiB CPU_Mapped share that all both-moved configs carry):
+
+| config | ctx | ub/b | result | device-0 stack (model + KV + rot + compute) |
+| --- | --- | --- | --- | --- |
+| attn:16 + mmproj CUDA1 | 105216 | 1024/2048 | PASS | 4660.03 + 3493.50 + 4.25 + 776.53 = 8934 (smi 9739) |
+| attn:16 + mmproj CUDA1 | 105216 | 2048/4096 | PASS | 4660.03 + 3493.50 + 4.25 + 1142.06 = 9300 (smi 9931, ~309 free) |
+
+Performance:
+
+| bench | config | PP tok/s | TG tok/s | MTP acc |
+| --- | --- | --- | --- | --- |
+| 90% fill (93,115-token prompt, spec on) | attn:16 + mmproj CUDA1, ub 1024 | **235.4** | 9.29 | 0.279 |
+| 90% fill | attn:16 + mmproj CUDA1, ub 2048 | 210.2 | 9.94 | 0.286 |
+| 90% fill | attn:15 (mmproj on CUDA0), ub 1024 | 217.8 | 8.91 | 0.294 |
+| 90% fill | attn:12 prod shape (mmproj on CUDA0), ub 1024 | 184.5 | 8.34 | 0.278 |
+| original one-shot rig (100,490 tok, n=512) | attn:16 + mmproj CUDA1, ub 1024 | **232.54** | 18.05 | 460.5 s wall |
+| original one-shot rig | attn:15, ub 1024 | 217.27 | 16.88 | 492.9 s wall |
+| original one-shot rig | attn:12 prod shape, ub 1024 | 168.34 | 17.12 | 626.9 s wall |
+
+Temp-0 identity probe identical across all configs. Vision smoke test
+(one 64x64 image through the chat-completions vision path on device 1,
+cc 6.1): dispatch clean, model answers the content correctly
+(`finish=stop`). The ub 2048 leg fits on VRAM but **inverts prefill**
+(−25 PP t/s vs ub 1024) while buying +0.65 TG at ~50 MiB free — ub 1024
+stays the operating point.
+
+Updated standing recommendation (fast device = 10 GB card):
+
+```
+--layer-split-hybrid attn:16
+--override-tensor '^blk\.64\..*=CUDA1,^output\.weight=CUDA1'
+--mmproj-device CUDA1
+--ctx-size 105000
+--batch-size 2048 --ubatch-size 1024
+```
+
+vs the attn:12 production shape: PP +27.6% (fill) / +38.1% (one-shot),
+TG +11.4% (fill) / +5.4% (one-shot), one-shot wall −26.6%, full original
+context retained, and the vision tower moves off the fast device.
+
