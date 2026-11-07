@@ -165,3 +165,76 @@ For this model on the 3080 + P40 pair: set
 `LLAMA_LAYER_SPLIT_HYBRID=attn:12`. The 12/16 boundary comes from the
 105,216-cell q8_0 KV; if context length or KV type changes, re-derive the
 quota from the per-layer costs above (~510 MiB per layer).
+
+## A1dig follow-up (2026-11-07): all 16 attention layers do fit — by moving the draft tower and output head off device 0
+
+The original sweep only varied the attention quota and left the draft tower
+(`blk.64`) and the output head pinned to device 0 via `--override-tensor`
+(the production overrides). Those two tensors are worth **990.94 MiB
+combined on device 0** (measured from the identical-shape loads below;
+output.weight ≈ 511 MiB, draft tower ≈ 480 MiB), and they are the reason
+attn:13 crashed there. Moving both to device 1 frees 991 MiB, which buys
+almost two full attention layers outright, and the remaining gap was closed
+by trimming the device-0 compute buffer (ubatch) or the context.
+
+Measured device-0 stack assembly (27B Q6_K, q8_0 KV, ctx 105216 unless noted;
+`load_tensors` / `llama_kv_cache` / `sched_reserve` log lines, -lv 4):
+
+| segment | value |
+| --- | --- |
+| attention layer weights | 291.25 MiB per layer (Q6_K) |
+| attention layer KV | 218.35 MiB per layer (16 layers -> 33.17 kB/token) |
+| attention-layer-only model buffer | `attn:16` model CUDA0 = 4660.03 MiB = 16 × 291.25 + shared ≈ 0 |
+| main-KV recurrent part | 655.03 MiB (48 recurrent layers) |
+| recurrent state (RS) | 598.50 MiB (CUDA1, unchanged in all configs) |
+| MTP draft-context KV | 411.00 MiB at ctx 105216 (377–391 at 96–100k) |
+| compute buffer | 776.53 MiB at ub 1024; 548–569 at ub 512; 493–502 at ub 256 |
+| allocatable on device 0 | ≈ 8576 MiB (10240 minus desktop + CUDA contexts measured via nvidia-smi) |
+
+Fit ladder verified by one llama-server launch per point (exit = fail, "listening" = pass):
+
+| config (override) | ctx/pad | ub | outcome | CUDA0 stack (model + KV + rot + comp) |
+| --- | --- | --- | --- | --- |
+| attn:13, draft+output on CUDA0 (prod style) | 105216 | 1024 | FAIL (exit) | 5125.34 + 2838.47 + 3.45 + 776.53 = 8732 MiB |
+| attn:14, draft CUDA1, output CUDA0 | 105216 | 1024 | FAIL (OOM 884.62 MiB) | — |
+| attn:15, draft CUDA1, output CUDA0 | 100096 | 512 | FAIL | — |
+| attn:16, draft+output CUDA1 | 105216 | 1024 | FAIL (exit) | 4660.03 + 3493.50 + 4.25 + 776.53 = 8934 MiB |
+| attn:16, draft+output CUDA1 | 105216 | 256 | FAIL (also fails the 884.62 MiB KV-extend retry) | 4660.03 + 3493.50 + 4.25 + 502.38 = 8660 MiB |
+| **attn:15, draft+output CUDA1 (full prod shape)** | **105216** | **1024** | **PASS** (473 MiB nvidia-smi headroom) | 4368.78 + 3275.16 + 3.98 + 776.53 = 8424 MiB |
+| **attn:16, draft+output CUDA1** | **103168** | **256** | **PASS** (307 MiB headroom) | 4660.03 + 3425.50 + 4.25 + 493.38 = 8583 MiB |
+| **attn:16, draft+output CUDA1** | **100096** | **512** | **PASS** (371 MiB headroom) | 4660.03 + 3323.50 + 4.25 + 568.77 = 8557 MiB |
+
+(The recurring "248.10 MiB cudaMalloc failed ... retry" line appears in every
+passing config including production's own shape; it is a reserve-iteration
+retry, not a fatal. A failed KV-extend retry of 884.62 MiB, by contrast, kills the process.)
+
+Performance (server, 90% ctx fill + 512 generated tokens, draft-mtp on,
+temp-0 identity probe identical across all configs, single rep per point):
+
+| config | ctx | ub | PP t/s | TG t/s | MTP acc |
+| --- | --- | --- | --- | --- | --- |
+| attn:12, draft+output CUDA0 (current prod shape) | 105216 | 1024 | 184.5 | 8.34 | 0.278 |
+| attn:15, draft+output CUDA1 | 105216 | 1024 | **217.8** (+18.1%) | 8.91 (+6.8%) | 0.294 |
+| attn:16, draft+output CUDA1 | 103168 | 256 | 206.5 (+12.0%) | 9.26 (+11.0%) | 0.283 |
+| attn:16, draft+output CUDA1 | 100096 | 512 | 212.1 (+15.0%) | **9.58** (+14.9%) | 0.291 |
+
+Cross-check at the llama-bench shape (p2048/n128, r=3, no overrides, hybrid
+placement only, draft+output auto on CUDA1) is bandwidth-bound and the
+output head on Pascal costs more than the attention gain there: PP 257.4/250.1/249.3
+and TG 9.18/8.95/8.96 for attn:12/15/16 — do NOT use the small-KV leg to
+tune placement; the 90%-fill server numbers above match the production
+regime. A short-prompt decode probe (512 generated, spec on) confirms the
+server numbers' order: a16 12.84/13.13 t/s vs a15 12.58/11.19 t/s (2 reps each).
+
+### Updated recommendation
+
+- Max decode (TG): `attn:16` + draft/head on device 1 at ctx 100096, ub 512 —
+  PP +15.0%, TG +14.9% over the current attn:12 production shape.
+- Max prefill with zero ctx/ubatch regression: `attn:15` + both moved at the
+  full 105216/ub1024 shape — PP +18.1%, TG +6.8%.
+- attn:16 with output/head: no fit at any ctx >= 100k tested with ub <= 1024;
+  the output head (≈511 MiB) is the binding resident on device 0.
+- Full 105216 ctx with attn:16 is infeasible at measured ub values (8660 MiB
+  at ub 256 vs ~8576 allocatable); only a KV-type reduction (e.g. q5/q4 KV)
+  or a smaller ctx would close that.
+
