@@ -10,7 +10,7 @@
 #   powershell -ExecutionPolicy Bypass -File scripts\check-arch.ps1 `
 #       -Binary build-dev\bin\ggml-cuda.dll       # (paths are relative to repo root)
 #       -Expected 61,86                            # default: 61;86
-#       -CUDAPath "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9"
+#       -CUDAPath "C:/path/to/cuda/toolkit"        # omit to use CUDA_PATH from the environment
 #
 # Exit codes: 0 = PASS (all expected archs in binary), 1 = FAIL, 2 = tooling error.
 
