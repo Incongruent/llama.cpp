@@ -194,10 +194,11 @@ profile re-prefills from zero. This fork introduces `A39-kv-stash-persistence`
   `n_ctx`, rope scale, draft model path, draft cache k/v} — a state of a
   different geometry cannot be restored by mistake (a missing combination
   that llama's own on-load checks also reject).
-- `conv_hash` = fnv over the raw token-id stream, so a later prompt whose
-  first tokens hash equal the saved prefix restores the state; the router
-  chat template must therefore be identical across profiles that are meant
-  to share state.
+- `conv_hash` = fnv over the TEXT-token stream (`get_text_tokens`, media
+  placeholders excluded), so a later prompt whose text-prefix hashes equal a
+  saved state restores it; media positions are excluded on purpose because
+  the raw accessor asserts on mtmd prompts, and the router chat template
+  must be identical across profiles that are meant to share state.
 - Restore path mirrors the existing slot save/restore task flow
   (`llama_state_seq_save_file`/`load_file` two-pass, context checkpoints and
   draft-speculative appendix inclusive); the common-prefix reuse machinery of

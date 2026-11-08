@@ -2034,8 +2034,13 @@ private:
             return false;
         }
 
-        // hash the raw token stream, so the restore side can verify the prefix
-        const llama_tokens & toks = slot.prompt.tokens.get_tokens();
+        const int64_t t_start = ggml_time_us();
+
+        // hash the raw token stream, so the restore side can verify the prefix;
+        // get_text_tokens is mtmd-safe (get_tokens would assert on prompts
+        // that carry image chunks), media placeholders are just skipped, and
+        // both sides derive their hashes from the same text-token sequence
+        const llama_tokens toks = slot.prompt.tokens.get_text_tokens();
         GGML_ASSERT(!toks.empty());
 
         kstash::state_tag tag;
@@ -2084,9 +2089,10 @@ private:
 
         kstash::prune_dir(kv_stash_dir, kv_stash_limit_bytes, filepath);
 
-        SRV_INF("kv stash: slot %d saved %lld tokens to '%s' (%.2f MiB state, %.2f MiB ckpt, %.2f MiB draft)\n",
+        SRV_INF("kv stash: slot %d saved %lld tokens to '%s' (%.2f MiB state, %.2f MiB ckpt, %.2f MiB draft, total %.2f ms)\n",
                 slot.id, (long long) tag.n_tokens, filepath.c_str(),
-                nwrite / (1024.0 * 1024.0), nwrite_ckpt / (1024.0 * 1024.0), nwrite_dft / (1024.0 * 1024.0));
+                nwrite / (1024.0 * 1024.0), nwrite_ckpt / (1024.0 * 1024.0), nwrite_dft / (1024.0 * 1024.0),
+                (ggml_time_us() - t_start) / 1000.0);
 
         return true;
     }
@@ -2096,13 +2102,18 @@ private:
             return;
         }
 
-        const llama_tokens & toks_in = incoming.get_tokens();
+        const int64_t t_start = ggml_time_us();
+
+        // the text-token view of the incoming stream: mtmd-safe on both
+        // sides and position-consistent with the dump-side hash
+        const llama_tokens toks_in = incoming.get_text_tokens();
 
         kstash::prefix_hasher hasher(toks_in.data(), toks_in.size());
 
         kstash::candidate cand;
         if (!kstash::find_best_state(kv_stash_dir, kv_stash_digest, hasher, toks_in.size(), cand)) {
-            return; // no matching prefix on disk: fall back to a full re-prefill
+            SLT_INF(slot, "kv stash: no matching state for %zu incoming tokens (new conversation or geometry change), full re-prefill will run\n", toks_in.size());
+            return;
         }
 
         SLT_INF(slot, "kv stash: matching state %lld/%zu tokens, restoring '%s'\n",
@@ -2144,9 +2155,10 @@ private:
         const size_t nread_ckpt = load_slot_checkpoints(cand.state_path, nread, slot);
         const size_t nread_dft  = load_slot_draft(cand.state_path, nread + nread_ckpt, slot);
 
-        SLT_INF(slot, "kv stash: restored %d tokens (%.2f MiB state, %.2f MiB ckpt, %.2f MiB draft)\n",
+        SLT_INF(slot, "kv stash: restored %d tokens (%.2f MiB state, %.2f MiB ckpt, %.2f MiB draft, restore took %.2f ms)\n",
                 (int) slot.prompt.tokens.size(),
-                nread / (1024.0 * 1024.0), nread_ckpt / (1024.0 * 1024.0), nread_dft / (1024.0 * 1024.0));
+                nread / (1024.0 * 1024.0), nread_ckpt / (1024.0 * 1024.0), nread_dft / (1024.0 * 1024.0),
+                (ggml_time_us() - t_start) / 1000.0);
     }
 
     // ----------------------------------------------------------------------
