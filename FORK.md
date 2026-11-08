@@ -171,6 +171,54 @@ Expected effect: identical synchronization semantics for GPU work (no
 wall-clock win expected), slightly less host-side bookkeeping, and no CPU
 backend stall. Also groundwork for finer-grained overlap later.
 
+### A39 — on-disk KV stash for router model swaps (`--kv-stash-dir`)
+
+Rationale: with llama-router (`--models-preset`, `--models-max 1`), every
+profile switch unloads the running child server and launches a fresh one, so
+the whole conversation KV is discarded; the next request on the previous
+profile re-prefills from zero. This fork introduces `A39-kv-stash-persistence`
+(new items below on top of the T1-T5 tip):
+
+- `--kv-stash-dir PATH` (env `LLAMA_ARG_KV_STASH_DIR`): enables stashing; the
+  child server saves the slot state of every idle slot at child unload
+  (the `server_context_impl::destroy()` path covers both router swaps and
+  plain shutdown), and restores the best-matching state into a fresh slot
+  when a later prompt extends a saved state.
+- `--kv-stash-limit-mib N` (env `LLAMA_ARG_KV_STASH_LIMIT_MIB`): prune the
+  dir to this total size after each save, oldest entries first (default
+  16384, 0 = no limit).
+- Files are `kvst_<digest>_<conv_hash>_<n_tokens>.kvstate` plus a `<name>.json`
+  sidecar (`digest`, `conv_hash`, `n_tokens`, `model_name`, `saved_at`), via
+  the new `tools/server/server-kv-stash.{h,cpp}`.
+- `digest` = fnv over {model path, mmproj path, cache_type k/v, `--layer-split-hybrid`,
+  `n_ctx`, rope scale, draft model path, draft cache k/v} — a state of a
+  different geometry cannot be restored by mistake (a missing combination
+  that llama's own on-load checks also reject).
+- `conv_hash` = fnv over the raw token-id stream, so a later prompt whose
+  first tokens hash equal the saved prefix restores the state; the router
+  chat template must therefore be identical across profiles that are meant
+  to share state.
+- Restore path mirrors the existing slot save/restore task flow
+  (`llama_state_seq_save_file`/`load_file` two-pass, context checkpoints and
+  draft-speculative appendix inclusive); the common-prefix reuse machinery of
+  the slot pipeline trims whatever part of the restored prefix the new prompt
+  does not cover, including a longer saved state whose tail covers the
+  previous model's generation (fallback path with a full re-prefill when
+  hashes do not match, so failure is always safe).
+- Files are written only into the directory passed with
+  `--kv-stash-dir`; once disabled no file writes happen beyond the baseline.
+
+Smoke (2026-11-08, CPU build, 0.8B model at ctx 8192, router with two
+profiles and two context sizes; same conversation swapped away and back):
+restore leg picked the same-digest state, restored 46 tokens from the
+saved stream against a 23-token re-request, and the prompt eval dropped
+from 89.49 ms / 23 tokens (no stash) to 30.36 ms / 4 tokens per request
+(the 19+ covered tokens served from the restored KV); temp-0 identity
+output unchanged. The mismatched digest on the second profile produced a
+full prefill as expected, and the persisted files were accepted after
+process restart. GPU-side validation against the production hybrid models
+remains pending.
+
 ## Performance summary
 
 | Change | Mechanism | Expected effect | Measured |
@@ -213,6 +261,11 @@ effects derived from the code, not as results.
 - A full link and runtime pass is the next step; runtime validation
   (tensor-split correctness, AllReduce numerics, pipeline-parallel output
   stability) is still pending.
+- A39: compiles as a CPU-only host-side change; router swap smoke on a
+  CPU-only 0.8B build passes (stash save at child unload, same-digest
+  restore on the next load, mismatched digest ignored, identity output
+  unchanged; see the A39 section). GPU-side validation against the
+  production hybrid models remains pending.
 
 ## Build notes
 
@@ -243,6 +296,10 @@ cmake --build build --config Release
 | `GGML_CUDA_AR_GRAPH_GUARD` | unset/`1`, `0` | default on: skip internal AR when a participating stream is capturing (A12) |
 | `LLAMA_MTP_PIN` | `off`/unset (default), any other value | pin MTP draft layers + their KV to the output device (A5) |
 | `LLAMA_OUTPUT_PIN` | `off`/unset (default), any other value | pin the output/logits head to the last GPU device (A13) |
+| `LLAMA_ARG_KV_STASH_DIR` | path, empty off (A39) | enable the on-disk KV stash (`--kv-stash-dir`) |
+| `LLAMA_ARG_KV_STASH_LIMIT_MIB` | MiB count (default 16384, 0 = no limit) | prune the KV stash after each save (`--kv-stash-limit-mib`) |
 
-All other behavior is unchanged from upstream. No files are written, no
-telemetry is added, and no persistent configuration is modified.
+All other behavior is unchanged from upstream. No telemetry is added and no
+persistent configuration is modified; the only file writes beyond the
+baseline are the A39 stash entries inside the directory passed with
+`--kv-stash-dir`, which never touches any other location.
