@@ -2789,20 +2789,35 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_SPLIT_MODE"));
     add_opt(common_arg(
-        {"--layer-split-hybrid"}, "{attn,attn:N,off}",
-        "hybrid attention layer placement across two GPUs, one of:\n"
+        {"--layer-split-hybrid"}, "{attn,attn:N,recr,recr:M,attn:N,recr:M,off}",
+        "hybrid layer placement across two GPUs, comma-separated list of:\n"
         "- attn: place all full-attention layers on device 0\n"
         "- attn:N (N >= 0): place the first N full-attention layers on device 0\n"
+        "- recr: place all recurrent layers on device 0\n"
+        "- recr:M (M >= 0): place the first M recurrent layers on device 0\n"
         "- off (default): standard layer split by tensor_split\n"
         "requires a hybrid-recurrent model and exactly 2 devices; ignores tensor_split when set",
         [](common_params & params, const std::string & value) {
-            if (value != "off" && value != "attn" && !(value.rfind("attn:", 0) == 0 && !value.empty()) ) {
-                throw std::invalid_argument("invalid value");
-            }
-            if (value.rfind("attn:", 0) == 0) {
-                const std::string q = value.substr(5);
-                if (q.empty() || q.find_first_not_of("0123456789") != std::string::npos || q.size() > 6) {
+            if (value != "off") {
+                if (value.empty()) {
                     throw std::invalid_argument("invalid value");
+                }
+                size_t beg = 0;
+                while (true) {
+                    const size_t end = value.find(',', beg);
+                    const std::string tok = value.substr(beg, end == std::string::npos ? std::string::npos : end - beg);
+                    bool ok = tok == "attn" || tok == "recr";
+                    if (!ok && (tok.rfind("attn:", 0) == 0 || tok.rfind("recr:", 0) == 0)) {
+                        const std::string q = tok.substr(5);
+                        ok = !q.empty() && q.size() <= 6 && q.find_first_not_of("0123456789") == std::string::npos;
+                    }
+                    if (!ok) {
+                        throw std::invalid_argument("invalid value");
+                    }
+                    if (end == std::string::npos) {
+                        break;
+                    }
+                    beg = end + 1;
                 }
             }
             params.layer_split_hybrid = value;

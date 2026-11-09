@@ -112,6 +112,28 @@ and TG +23.2% over the same build at `off`; it is also the largest quota
 that fits the 10 GB card. Details and the fit boundary:
 [HYBRID_LAYER_SPLIT_BENCHMARK.md](HYBRID_LAYER_SPLIT_BENCHMARK.md).
 
+### A19 — hybrid recurrent-layer quota (`--layer-split-hybrid recr:M`)
+
+Extends the A1 grammar from a single `attn`/`attn:N` token to a
+comma-separated list, adding a recurrent-layer quota:
+
+- `attn` / `attn:N`: as before, all / the first N full-attention layers on
+  device 0.
+- `recr` / `recr:M`: all / the first M recurrent (GDN) trunk layers on
+  device 0.
+- a class that is not listed keeps 0 layers on device 0, so `attn:16`
+  alone is unchanged.
+- `off` remains the default; `LLAMA_LAYER_SPLIT_HYBRID` accepts the same
+  grammar.
+
+The recurrent KV/conv state follows `dev_layer` automatically, so this is
+placement-only. The intended use is to spend headroom freed on device 0
+(for example by `--cache-type-k q4_0 --cache-type-v q4_0`) on moving
+bandwidth-bound recurrent layers from the slow-large device to the
+fast-small one: during decode those layers stream weights while the fast
+device is otherwise idle, and during prefill their GEMMs run on the faster
+compute.
+
 ### A2 — P2P setup is tri-state and tolerant (`GGML_CUDA_P2P`)
 
 Before: presence of the environment variable enabled P2P, absence disabled
@@ -235,7 +257,7 @@ cmake --build build --config Release
 | Variable | Values | Effect |
 | --- | --- | --- |
 | `GGML_CUDA_AR_DISABLE` | set | disable internal AllReduce, use fallback |
-| `LLAMA_LAYER_SPLIT_HYBRID` | `attn`, `attn:N`, `off` | hybrid-aware attention placement (A1) |
+| `LLAMA_LAYER_SPLIT_HYBRID` | `attn`, `attn:N`, `recr`, `recr:M`, comma-separated, `off` | hybrid-aware attention/recurrent placement (A1/A19) |
 | `GGML_CUDA_P2P` | unset/`1`, `0` | auto/on, off (A2) |
 | `GGML_CUDA_FA_DEBUG` | set | one-shot audit log of flash-attention kernel selection per device (A15) |
 | `GGML_CUDA_AR_SPIN_CYCLES` | 0..2^20 (default 16384) | pre-Volta AR poll throttle in SM cycles; 0 removes the throttle (A9) |

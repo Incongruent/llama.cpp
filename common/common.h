@@ -492,8 +492,9 @@ struct common_params {
     enum llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER; // how to split the model across GPUs
     enum llama_load_mode  load_mode  = LLAMA_LOAD_MODE_AUTO; // how to load the model
 
-    // hybrid attention layer placement for hybrid-recurrent archs on 2 devices:
-    // "" = unset (falls back to the legacy LLAMA_LAYER_SPLIT_HYBRID env var), "off", "attn", "attn:N"
+    // hybrid layer placement for hybrid-recurrent archs on 2 devices:
+    // "" = unset (falls back to the legacy LLAMA_LAYER_SPLIT_HYBRID env var), "off",
+    // or a comma-separated list of "attn", "attn:N", "recr", "recr:M"
     std::string layer_split_hybrid = "";
 
     enum llama_lazy_mode lazy_mode = LLAMA_LAZY_MODE_AUTO; // on-demand reading of tensors marked by the arch
