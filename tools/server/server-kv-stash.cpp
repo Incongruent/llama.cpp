@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -28,7 +29,7 @@ uint64_t hash_tokens(const llama_token * data, size_t n_tokens) {
 }
 
 uint64_t prefix_hasher::prefix_hash(size_t n) const {
-    return hash_tokens(data, n < n_tokens ? n : n_tokens);
+    return hash_tokens(data_, n < n_tokens_ ? n : n_tokens_);
 }
 
 static uint64_t fnva_str(uint64_t h, const std::string & s) {
@@ -124,8 +125,44 @@ bool read_sidecar(const std::string & sidecar_path, state_tag & t, std::string &
     }
 }
 
+bool write_token_file(const std::string & path, const llama_token * data, size_t n_tokens) {
+    try {
+        std::ofstream ofs(fs::path(path), std::ios::binary | std::ios::trunc);
+        if (!ofs) {
+            return false;
+        }
+        ofs.write(reinterpret_cast<const char *>(data), (std::streamsize) (n_tokens * sizeof(llama_token)));
+        return !!ofs;
+    } catch (const std::exception &) {
+        return false;
+    }
+}
+
+bool read_token_file(const std::string & path, std::vector<llama_token> & out, size_t expect_n) {
+    try {
+        std::error_code ec;
+        const auto sz = fs::file_size(fs::path(path), ec);
+        if (ec || sz % sizeof(llama_token) != 0) {
+            return false;
+        }
+        if (sz / sizeof(llama_token) != expect_n) {
+            return false;
+        }
+        std::ifstream ifs(fs::path(path), std::ios::binary);
+        if (!ifs) {
+            return false;
+        }
+        out.resize(expect_n);
+        ifs.read(reinterpret_cast<char *>(out.data()), (std::streamsize) sz);
+        return (size_t) ifs.gcount() == sz;
+    } catch (const std::exception &) {
+        return false;
+    }
+}
+
 bool find_best_state(const std::string & dir, const std::string & digest,
-                     const prefix_hasher & hasher, size_t n_incoming, candidate & out) {
+                     const prefix_hasher & hasher, size_t n_incoming, candidate & out,
+                     std::string * note) {
     std::error_code ec;
     if (!fs::exists(fs::path(dir), ec) || ec) {
         return false;
@@ -169,28 +206,44 @@ bool find_best_state(const std::string & dir, const std::string & digest,
         return a.tag.n_tokens > b.tag.n_tokens;
     });
 
-    // candidates fully inside the incoming stream are exact-verified:
-    // the saved token hash must equal the hash of the first n saved tokens
+    size_t n_refused_superset = 0;
+
     for (const auto & c : cands) {
         const size_t n = (size_t) c.tag.n_tokens;
-        if (n > n_incoming) {
+        if (n <= n_incoming) {
+            // saved stream fits inside the incoming prompt: exact-verify the
+            // shared prefix (hash of the first n incoming tokens)
+            if (hex64(hasher.prefix_hash(n)) == c.tag.conv_hash) {
+                out = c;
+                return true;
+            }
             continue;
         }
-        if (hex64(hasher.prefix_hash(n)) == c.tag.conv_hash) {
-            out = c;
-            return true;
+
+        // saved stream is longer than the incoming prompt: only a verified
+        // token prefix may be restored (client-side compaction / retried turn).
+        // the .tokens companion is the only source of the saved stream's
+        // tokens, so a missing companion means "cannot verify" = refuse.
+        std::vector<llama_token> saved;
+        if (!read_token_file(c.state_path + ".tokens", saved, n)) {
+            n_refused_superset++;
+            continue;
         }
+        if (hex64(hash_tokens(saved.data(), saved.size())) != c.tag.conv_hash) {
+            n_refused_superset++;
+            continue;
+        }
+        if (n_incoming == 0 || std::memcmp(saved.data(), hasher.data(), n_incoming * sizeof(llama_token)) != 0) {
+            n_refused_superset++;
+            continue;
+        }
+        out = c;
+        return true;
     }
 
-    // no exact match: fall back to the longest candidate (the server trims
-    // whatever the incoming prompt does not cover)
-    for (const auto & c : cands) {
-        if ((size_t) c.tag.n_tokens > n_incoming) {
-            out = c;
-            return true;
-        }
+    if (note != nullptr && n_refused_superset > 0) {
+        *note = std::to_string(n_refused_superset) + " longer state(s) refused: incoming prompt is not their token prefix";
     }
-
     return false;
 }
 
@@ -257,6 +310,7 @@ void prune_dir(const std::string & dir, int64_t limit_bytes, const std::string &
         }
 
         fs::remove(fs::path(s.path.string() + ".json"), rm_err);
+        fs::remove(fs::path(s.path.string() + ".tokens"), rm_err);
         fs::remove(s.path, rm_err);
         total -= s.size;
     }

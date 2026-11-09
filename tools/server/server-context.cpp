@@ -2081,9 +2081,19 @@ private:
             return false;
         }
 
+        // companion token stream: the only way the restore side can verify
+        // that a longer saved state is a true prefix of an incoming prompt
+        if (!kstash::write_token_file(filepath + ".tokens", toks.data(), toks.size())) {
+            std::remove(filepath.c_str());
+            std::remove((filepath + ".json").c_str());
+            std::remove((filepath + ".tokens").c_str());
+            return false;
+        }
+
         if (!kstash::write_sidecar(filepath, tag, params_base.model.path)) {
             std::remove(filepath.c_str());
             std::remove((filepath + ".json").c_str());
+            std::remove((filepath + ".tokens").c_str());
             return false;
         }
 
@@ -2111,13 +2121,17 @@ private:
         kstash::prefix_hasher hasher(toks_in.data(), toks_in.size());
 
         kstash::candidate cand;
-        if (!kstash::find_best_state(kv_stash_dir, kv_stash_digest, hasher, toks_in.size(), cand)) {
-            SLT_INF(slot, "kv stash: no matching state for %zu incoming tokens (new conversation or geometry change), full re-prefill will run\n", toks_in.size());
+        std::string why;
+        if (!kstash::find_best_state(kv_stash_dir, kv_stash_digest, hasher, toks_in.size(), cand, &why)) {
+            SLT_INF(slot, "kv stash: no matching state for %zu incoming tokens (%s), full re-prefill will run\n",
+                    toks_in.size(), why.empty() ? "new conversation or geometry change" : why.c_str());
             return;
         }
 
-        SLT_INF(slot, "kv stash: matching state %lld/%zu tokens, restoring '%s'\n",
-                (long long) cand.tag.n_tokens, toks_in.size(), cand.state_path.c_str());
+        SLT_INF(slot, "kv stash: matching state %lld/%zu tokens%s, restoring '%s'\n",
+                (long long) cand.tag.n_tokens, toks_in.size(),
+                cand.tag.n_tokens > (int64_t) toks_in.size() ? " (superset, prefix-verified)" : "",
+                cand.state_path.c_str());
 
         size_t nread = 0;
         try {
