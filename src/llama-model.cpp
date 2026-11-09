@@ -1757,33 +1757,58 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         splits[i] = split_sum != 0.0f ? splits[i] / split_sum : float(i + 1) / n_devices();
     }
 
-    // A1: optional hybrid-aware placement, default off.
+    // A1/A19: optional hybrid-aware placement, default off.
     // precedence: --layer-split-hybrid (LLAMA_ARG_LAYER_SPLIT_HYBRID) > legacy LLAMA_LAYER_SPLIT_HYBRID env
-    int hybrid_attn_dev0 = -1; // -1: disabled, INT_MAX: all, >= 0: quota
+    // grammar: comma-separated attn[:N], recr[:M]; a class that is not listed keeps 0 layers on device 0
+    bool hybrid_place_enabled = false;
+    int hybrid_attn_dev0 = 0;
+    int hybrid_recr_dev0 = 0;
     const char * hybrid_place = params.hybrid_attn ? params.hybrid_attn : getenv("LLAMA_LAYER_SPLIT_HYBRID");
-    if (hybrid_place) {
+    if (hybrid_place && hybrid_place[0] != '\0' && strcmp(hybrid_place, "off") != 0) {
         if (llm_arch_is_hybrid(arch) && n_devices() == 2) {
-            if (strcmp(hybrid_place, "attn") == 0) {
-                hybrid_attn_dev0 = INT_MAX;
-            } else if (strncmp(hybrid_place, "attn:", 5) == 0) {
-                hybrid_attn_dev0 = std::max(0, atoi(hybrid_place + 5));
-            } else if (hybrid_place[0] != '\0' && strcmp(hybrid_place, "off") != 0) {
-                LLAMA_LOG_WARN("%s: ignoring unknown hybrid attention placement value '%s'\n", __func__, hybrid_place);
+            bool hybrid_place_valid = true;
+            const std::string spec = hybrid_place;
+            size_t beg = 0;
+            while (true) {
+                const size_t end = spec.find(',', beg);
+                const std::string tok = spec.substr(beg, end == std::string::npos ? std::string::npos : end - beg);
+                if (tok == "attn") {
+                    hybrid_attn_dev0 = INT_MAX;
+                } else if (tok == "recr") {
+                    hybrid_recr_dev0 = INT_MAX;
+                } else if (tok.rfind("attn:", 0) == 0 && tok.size() > 5) {
+                    hybrid_attn_dev0 = std::max(0, atoi(tok.c_str() + 5));
+                } else if (tok.rfind("recr:", 0) == 0 && tok.size() > 5) {
+                    hybrid_recr_dev0 = std::max(0, atoi(tok.c_str() + 5));
+                } else {
+                    hybrid_place_valid = false;
+                    break;
+                }
+                if (end == std::string::npos) {
+                    break;
+                }
+                beg = end + 1;
+            }
+            if (hybrid_place_valid) {
+                hybrid_place_enabled = true;
+            } else {
+                LLAMA_LOG_WARN("%s: ignoring unknown hybrid layer placement value '%s'\n", __func__, hybrid_place);
             }
         } else {
-            LLAMA_LOG_WARN("%s: hybrid attention placement requires a hybrid arch and exactly 2 devices, ignored\n", __func__);
+            LLAMA_LOG_WARN("%s: hybrid layer placement requires a hybrid arch and exactly 2 devices, ignored\n", __func__);
         }
     }
-    if (hybrid_attn_dev0 >= 0) {
+    if (hybrid_place_enabled) {
         if (!all_zero) {
-            LLAMA_LOG_WARN("%s: hybrid attention placement ignores tensor_split\n", __func__);
+            LLAMA_LOG_WARN("%s: hybrid layer placement ignores tensor_split\n", __func__);
         }
-        LLAMA_LOG_INFO("%s: hybrid layer split: up to %d full-attention layers on %s, remaining layers on %s\n",
-                __func__, hybrid_attn_dev0,
+        LLAMA_LOG_INFO("%s: hybrid layer split: up to %d full-attention and %d recurrent layers on %s, remaining layers on %s\n",
+                __func__, hybrid_attn_dev0, hybrid_recr_dev0,
                 ggml_backend_dev_name(devices.at(0).dev),
                 ggml_backend_dev_name(devices.at(1).dev));
     }
     int n_attn_dev0 = 0;
+    int n_recr_dev0 = 0;
     int mtp_pin_dev = -1; // A5: >= 0 when MTP draft layers are pinned (device index)
 
     // A5: if enabled, MTP draft layers (il >= n_layer) and their KV will be
@@ -1814,12 +1839,16 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d (MTP pin)\n", il, ggml_backend_dev_name(dev), is_swa);
             return {dev, &pimpl->gpu_buft_list.at(dev)};
         }
-        if (hybrid_attn_dev0 >= 0) {
+        if (hybrid_place_enabled) {
             const bool is_full_attn = il < (int) hparams.n_layer() && !hparams.is_recr(il);
+            const bool is_recr     = il < (int) hparams.n_layer() &&  hparams.is_recr(il);
             size_t gpu = 1;
             if (is_full_attn && n_attn_dev0 < hybrid_attn_dev0) {
                 gpu = 0;
                 ++n_attn_dev0;
+            } else if (is_recr && n_recr_dev0 < hybrid_recr_dev0) {
+                gpu = 0;
+                ++n_recr_dev0;
             }
             auto * dev = devices.at(gpu).dev;
             LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d (hybrid split)\n", il, ggml_backend_dev_name(dev), is_swa);
