@@ -220,7 +220,15 @@ profile re-prefills from zero. This fork introduces `A39-kv-stash-persistence`
   placeholders excluded), so a later prompt whose text-prefix hashes equal a
   saved state restores it; media positions are excluded on purpose because
   the raw accessor asserts on mtmd prompts, and the router chat template
-  must be identical across profiles that are meant to share state.
+  must be identical across profiles that are meant to share state. Because
+  the key is text-only, A39.1 (2026-11-11) added `kstash::stream_has_media()`
+  (a raw `LLAMA_TOKEN_NULL` scan via the new assert-free
+  `server_tokens::get_raw_tokens()` accessor) with a hard refusal on BOTH
+  the dump path (`kv_stash_dump_slot`) and the consult path
+  (`kv_stash_try_restore`): media-bearing conversations are neither saved
+  nor restored, the stash is text-only by design (multimodal use is
+  unsupported and explicitly refused), and the same-text/different-image
+  collision class is closed.
 - Restore path mirrors the existing slot save/restore task flow
   (`llama_state_seq_save_file`/`load_file` two-pass, context checkpoints and
   draft-speculative appendix inclusive); the common-prefix reuse machinery of
@@ -239,8 +247,18 @@ from 89.49 ms / 23 tokens (no stash) to 30.36 ms / 4 tokens per request
 (the 19+ covered tokens served from the restored KV); temp-0 identity
 output unchanged. The mismatched digest on the second profile produced a
 full prefill as expected, and the persisted files were accepted after
-process restart. GPU-side validation against the production hybrid models
-remains pending.
+process restart.
+
+Production validation (dual-GPU hybrid Qwen ladder, 3080+P40 rig; reports
+`C:\code\A39_TEST_REPORT_20261109.md` and `A39_TEST_REPORT_20261110.md`):
+the 11-09 epoch passed with 7 dumps / 4 restore legs (~230k tokens of
+re-prefill avoided); the 11-10 epoch ran 1/10 restore legs with all 9
+refusals by design (superset-check rejections after client-side
+compaction). Live A59 refusal instrumentation (2026-11-11) logs the
+first-mismatch index: the first refusal diverged at token 6019 of an
+117,348-token candidate vs 81,474 incoming tokens (prefix rewritten from
+token 0, unsalvageable by any disk state). The CPU 0.8B smoke above is a
+mechanism check only; the ladder above is the A39 evidence base.
 
 ## Performance summary
 
@@ -287,8 +305,11 @@ effects derived from the code, not as results.
 - A39: compiles as a CPU-only host-side change; router swap smoke on a
   CPU-only 0.8B build passes (stash save at child unload, same-digest
   restore on the next load, mismatched digest ignored, identity output
-  unchanged; see the A39 section). GPU-side validation against the
-  production hybrid models remains pending.
+  unchanged; see the A39 section). GPU-side validation is done: the
+  dual-GPU hybrid Qwen ladder (11-09 PASS epoch, 11-10 by-design-refusal
+  epoch, A59 live refusal instrumentation) — see the A39 section. A39.1
+  (2026-11-11) added the media hard-refusal guard (`stream_has_media`,
+  dump + consult) with unit tests in `tests/test-kv-stash.cpp`.
 
 ## Build notes
 

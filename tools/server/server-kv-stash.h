@@ -30,6 +30,16 @@ struct state_tag {
 
 uint64_t hash_tokens(const llama_token * data, size_t n_tokens);
 
+// fork A39.1: true when the raw token stream carries media placeholder
+// (LLAMA_TOKEN_NULL) entries, i.e. the conversation includes image/audio
+// chunks. The stash conversation key is the TEXT-token stream (placeholders
+// filtered), so two conversations with identical text but different media
+// would be indistinguishable and could restore each other's KV (image
+// positions carrying the other conversation's media content). Such streams
+// are hard-refused by the stash on both the dump and the consult side -
+// multimodal use is unsupported by the stash by design.
+bool stream_has_media(const llama_token * data, size_t n_tokens);
+
 std::string hex64(uint64_t v);
 
 std::string geometry_digest(const std::vector<std::string> & parts);

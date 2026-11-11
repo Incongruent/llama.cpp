@@ -2034,6 +2034,17 @@ private:
             return false;
         }
 
+        // fork A39.1: the stash conversation key is the text-token stream
+        // (media placeholders filtered); a media-bearing conversation would
+        // collide with a same-text/different-image conversation and could
+        // restore the wrong KV. Hard-refused on both sides - multimodal use
+        // is unsupported by the stash by design.
+        const llama_tokens & raw = slot.prompt.tokens.get_raw_tokens();
+        if (kstash::stream_has_media(raw.data(), raw.size())) {
+            SRV_INF("kv stash: slot %d skipped (dump): conversation carries media, stash is text-only\n", slot.id);
+            return false;
+        }
+
         const int64_t t_start = ggml_time_us();
 
         // hash the raw token stream, so the restore side can verify the prefix;
@@ -2109,6 +2120,16 @@ private:
 
     void kv_stash_try_restore(server_slot & slot, const server_tokens & incoming) {
         if (incoming.empty() || !kv_stash_enabled()) {
+            return;
+        }
+
+        // fork A39.1: media-bearing incoming streams are hard-refused -
+        // same-text/different-image streams would collide on the text-token
+        // conv_hash (a full re-prefill is always the correct behavior for
+        // them); symmetric with the dump-side guard.
+        const llama_tokens & raw_in = incoming.get_raw_tokens();
+        if (kstash::stream_has_media(raw_in.data(), raw_in.size())) {
+            SLT_INF(slot, "kv stash: skipped (consult): incoming carries media in %zu raw tokens, stash is text-only, full re-prefill will run\n", raw_in.size());
             return;
         }
 

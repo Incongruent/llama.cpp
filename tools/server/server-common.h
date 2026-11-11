@@ -232,6 +232,14 @@ public:
     // for compatibility with speculative decoding, ctx shift
     const llama_tokens & get_tokens() const;
 
+    // fork A39.1: raw token stream including media placeholders
+    // (LLAMA_TOKEN_NULL); mtmd-safe counterpart of get_tokens() (which
+    // asserts !has_mtmd). Used by the KV stash to detect media-bearing
+    // conversations, which it hard-refuses (its conversation key is the
+    // text-token stream, so same-text/different-image streams would
+    // collide).
+    const llama_tokens & get_raw_tokens() const { return tokens; }
+
     llama_tokens get_text_tokens() const;
 
     std::vector<char> serialize() const;

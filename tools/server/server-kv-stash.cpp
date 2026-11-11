@@ -33,6 +33,15 @@ uint64_t prefix_hasher::prefix_hash(size_t n) const {
     return hash_tokens(data_, n < n_tokens_ ? n : n_tokens_);
 }
 
+bool stream_has_media(const llama_token * data, size_t n_tokens) {
+    for (size_t i = 0; i < n_tokens; ++i) {
+        if (data[i] == LLAMA_TOKEN_NULL) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static uint64_t fnva_str(uint64_t h, const std::string & s) {
     for (uint8_t c : s) {
         h ^= c;
