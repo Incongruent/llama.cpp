@@ -196,6 +196,10 @@ static void test(void) {
     argv = {"binary_name", "-sm", "hello"};
     assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
 
+    // wrong value (fused gated delta net path, A23)
+    argv = {"binary_name", "--fgdn", "hello"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+
     {
         common_params penalty_params;
         assert(penalty_params.sampling.penalty_last_n == 64);
@@ -248,6 +252,19 @@ static void test(void) {
     argv = {"binary_name", "-t", "1234"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.cpuparams.n_threads == 1234);
+
+    // fused gated delta net path (A23)
+    {
+        common_params fresh_params;
+        assert(fresh_params.fused_gdn == "on");
+    }
+
+    const char * fgdn_values[] = {"on", "off-ch", "off-all", "auto"};
+    for (const char * value : fgdn_values) {
+        argv = {"binary_name", "--fgdn", value};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+        assert(params.fused_gdn == value);
+    }
 
     argv = {"binary_name", "--verbose"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
