@@ -612,12 +612,22 @@ llama_context::llama_context(
             } else if (fgdn == "auto") {
                 for (auto & backend : backends) {
                     auto * dev = ggml_backend_get_device(backend.get());
-                    if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+                    if (!dev) {
+                        LLAMA_LOG_INFO("%s: fgdn auto: backend %s has no device\n", __func__, ggml_backend_name(backend.get()));
                         continue;
                     }
                     ggml_backend_dev_props props = {};
                     ggml_backend_dev_get_props(dev, &props);
-                    if (props.cc > 0 && props.cc < 0x70) { // Volta = cc 7.0 = 0x70 (0x100*major + 0x10*minor)
+                    LLAMA_LOG_INFO("%s: fgdn auto: dev %s type %d cc %d\n", __func__,
+                            ggml_backend_dev_name(dev), (int) ggml_backend_dev_type(dev), (int) props.cc);
+                    if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+                        continue;
+                    }
+                    if (props.cc > 0 && props.cc < 860) { // cc encoding is 100*major + 10*minor (see ggml-cuda.cu);
+                                                          // the fused GDN MMA schedule is enabled only for
+                                                          // GA10x (860) and newer server archs (890, 1200+),
+                                                          // everything older takes the same fused-op fallback
+                                                          // rejection the kernel itself applies
                         cparams.fused_gdn_ch = false;
                         break;
                     }
