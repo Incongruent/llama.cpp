@@ -649,6 +649,12 @@ struct common_params {
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
     bool    cache_ram_explicit  = false; // set by --cache-ram, decision models disable the cache otherwise
 
+    // KV-cache stash: persist slot states to disk at sleep/exit, restore on
+    // matching prompts (survives model swaps in router mode and restarts)
+    bool        kv_stash_enabled    = false; // set by --kv-stash-dir
+    std::string kv_stash_dir        = "";    // directory holding the saved state files
+    int32_t     kv_stash_limit_mib  = 16384; // prune the stash after each save (0 = no limit)
+
     // llama-connect params
     bool        server_connect      = false;
     std::string server_connect_code = "";

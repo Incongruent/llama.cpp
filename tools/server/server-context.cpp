@@ -11,6 +11,7 @@
 #include "server-realtime.h"
 #include "server-schema.h"
 #include "server-stream.h"
+#include "server-kv-stash.h"
 
 #include "build-info.h"
 #include "common.h"
@@ -1124,6 +1125,14 @@ private:
     // Necessary similarity of prompt for slot selection
     float slot_prompt_similarity = 0.0f;
 
+    // KV-cache stash (fork A39): persists slot states at sleep/exit and stages
+    // them back into fresh slots, so conversations survive llama-router model
+    // swaps and process restarts (knobs validated in load_model)
+    bool        kv_stash_on          = false;
+    std::string kv_stash_dir;
+    int64_t     kv_stash_limit_bytes = 0;   // > 0: prune the stash after each save
+    std::string kv_stash_digest;            // model + KV geometry identity of this instance
+
     std::string model_name; // name of the loaded model, to be used by API
     std::set<std::string> model_aliases; // additional names for the model
     std::set<std::string> model_tags;    // informational tags
@@ -1133,6 +1142,12 @@ private:
     int64_t t_last_load_progress_ms = 0;
 
     void destroy() {
+        // persist the live slot states into the KV stash before the context
+        // dies (covers both explicit unload and graceful child shutdown)
+        if (kv_stash_enabled()) {
+            kv_stash_dump_all();
+        }
+
         spec.reset();
         spec_init.reset();
 
@@ -1605,6 +1620,47 @@ private:
         }
         SRV_TRC("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
 
+        // KV-cache stash: enabled via --kv-stash-dir; the digest keys the files
+        // by model path + K/V types + context size + rope scale + draft model,
+        // so a state from another geometry could never be restored by mistake
+        kv_stash_on = params_base.kv_stash_enabled && !params_base.kv_stash_dir.empty();
+        if (kv_stash_on) {
+            kv_stash_dir = params_base.kv_stash_dir;
+            if (params_base.kv_stash_limit_mib > 0) {
+                kv_stash_limit_bytes = (int64_t) params_base.kv_stash_limit_mib * (1024 * 1024);
+            } else {
+                kv_stash_limit_bytes = 0;
+            }
+
+            if (!kstash::ensure_dir(kv_stash_dir)) {
+                SRV_ERR("kv stash: failed to create directory '%s', disabling\n", kv_stash_dir.c_str());
+                kv_stash_on = false;
+            } else {
+                const float rope_scale = params_base.rope_freq_scale != 0.0f ? params_base.rope_freq_scale : 1.0f;
+                kv_stash_digest = kstash::geometry_digest({
+                    params_base.model.path,
+                    params_base.mmproj.path,
+                    std::to_string((int) params_base.cache_type_k),
+                    std::to_string((int) params_base.cache_type_v),
+                    params_base.layer_split_hybrid,
+                    std::to_string(n_ctx),
+                    string_format("%.9f", rope_scale),
+                    params_base.speculative.draft.mparams.path,
+                    std::to_string((int) params_base.speculative.draft.cache_type_k),
+                    std::to_string((int) params_base.speculative.draft.cache_type_v),
+                });
+
+                const std::string limit_str = kv_stash_limit_bytes > 0
+                    ? string_format("limit %d MiB", params_base.kv_stash_limit_mib)
+                    : std::string("no limit");
+
+                SRV_INF("kv stash enabled: dir '%s', digest '%s', %s\n",
+                        kv_stash_dir.c_str(), kv_stash_digest.c_str(), limit_str.c_str());
+
+                kstash::prune_dir(kv_stash_dir, kv_stash_limit_bytes, "");
+            }
+        }
+
         if (params_base.n_ctx_checkpoints > 0) {
             SRV_TRC("context checkpoints enabled, max = %d, min spacing = %d\n",
                     params_base.n_ctx_checkpoints, params_base.checkpoint_min_step);
@@ -1898,6 +1954,12 @@ private:
 
                 SRV_TRC("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
             }
+
+            // nothing was staged through the RAM prompt cache: try to stage
+            // a matching prefix back from the on-disk KV stash (fork A39)
+            if (ret->prompt.tokens.empty()) {
+                kv_stash_try_restore(*ret, task.tokens);
+            }
         }
 
         return ret;
@@ -1934,6 +1996,187 @@ private:
 
         return res;
     }
+
+    // KV-cache stash (fork A39): disk persistence for slot states ---------
+
+    bool kv_stash_enabled() const {
+        return kv_stash_on && !kv_stash_digest.empty();
+    }
+
+    void kv_stash_dump_all() {
+        if (!kv_stash_enabled()) {
+            return;
+        }
+
+        const int64_t t_start = ggml_time_us();
+
+        int64_t n_states = 0;
+        int64_t n_tokens = 0;
+
+        for (auto & slot : slots) {
+            if (slot.state != SLOT_STATE_IDLE || slot.prompt.tokens.empty()) {
+                continue;
+            }
+
+            if (kv_stash_dump_slot(slot)) {
+                n_states++;
+                n_tokens += slot.prompt.tokens.size();
+            }
+        }
+
+        SRV_INF("kv stash: saved %lld states (%lld tokens) in %.2f ms\n",
+                (long long) n_states, (long long) n_tokens, (ggml_time_us() - t_start) / 1000.0);
+    }
+
+    bool kv_stash_dump_slot(server_slot & slot) {
+        if (slot.ctx_tgt != ctx_tgt) {
+            SRV_WRN("kv stash: slot %d context mismatch, skipping\n", slot.id);
+            return false;
+        }
+
+        const int64_t t_start = ggml_time_us();
+
+        // hash the raw token stream, so the restore side can verify the prefix;
+        // get_text_tokens is mtmd-safe (get_tokens would assert on prompts
+        // that carry image chunks), media placeholders are just skipped, and
+        // both sides derive their hashes from the same text-token sequence
+        const llama_tokens toks = slot.prompt.tokens.get_text_tokens();
+        GGML_ASSERT(!toks.empty());
+
+        kstash::state_tag tag;
+        tag.digest    = kv_stash_digest;
+        tag.conv_hash = kstash::hex64(kstash::hash_tokens(toks.data(), toks.size()));
+        tag.n_tokens  = (int64_t) toks.size();
+
+        const std::string filepath = kv_stash_dir + "/" + kstash::state_base_name(tag);
+
+        std::vector<char> packed;
+        try {
+            packed = slot.prompt.tokens.serialize();
+        } catch (const std::exception & err) {
+            SRV_WRN("kv stash: cannot serialize slot %d: %s\n", slot.id, err.what());
+            return false;
+        }
+
+        GGML_ASSERT(packed.size() % sizeof(llama_token) == 0);
+        const size_t nwrite = llama_state_seq_save_file(
+            ctx_tgt, filepath.c_str(), slot.id,
+            reinterpret_cast<const llama_token *>(packed.data()), packed.size() / sizeof(llama_token));
+        if (nwrite == 0) {
+            SRV_WRN("kv stash: state save failed for slot %d\n", slot.id);
+            return false;
+        }
+
+        size_t nwrite_ckpt = 0;
+        if (!save_slot_checkpoints(filepath, slot, nwrite_ckpt)) {
+            std::remove(filepath.c_str());
+            std::remove((filepath + ".json").c_str());
+            return false;
+        }
+
+        size_t nwrite_dft = 0;
+        if (!save_slot_draft(filepath, slot, nwrite_dft)) {
+            std::remove(filepath.c_str());
+            std::remove((filepath + ".json").c_str());
+            return false;
+        }
+
+        // companion token stream: the only way the restore side can verify
+        // that a longer saved state is a true prefix of an incoming prompt
+        if (!kstash::write_token_file(filepath + ".tokens", toks.data(), toks.size())) {
+            std::remove(filepath.c_str());
+            std::remove((filepath + ".json").c_str());
+            std::remove((filepath + ".tokens").c_str());
+            return false;
+        }
+
+        if (!kstash::write_sidecar(filepath, tag, params_base.model.path)) {
+            std::remove(filepath.c_str());
+            std::remove((filepath + ".json").c_str());
+            std::remove((filepath + ".tokens").c_str());
+            return false;
+        }
+
+        kstash::prune_dir(kv_stash_dir, kv_stash_limit_bytes, filepath);
+
+        SRV_INF("kv stash: slot %d saved %lld tokens to '%s' (%.2f MiB state, %.2f MiB ckpt, %.2f MiB draft, total %.2f ms)\n",
+                slot.id, (long long) tag.n_tokens, filepath.c_str(),
+                nwrite / (1024.0 * 1024.0), nwrite_ckpt / (1024.0 * 1024.0), nwrite_dft / (1024.0 * 1024.0),
+                (ggml_time_us() - t_start) / 1000.0);
+
+        return true;
+    }
+
+    void kv_stash_try_restore(server_slot & slot, const server_tokens & incoming) {
+        if (incoming.empty() || !kv_stash_enabled()) {
+            return;
+        }
+
+        const int64_t t_start = ggml_time_us();
+
+        // the text-token view of the incoming stream: mtmd-safe on both
+        // sides and position-consistent with the dump-side hash
+        const llama_tokens toks_in = incoming.get_text_tokens();
+
+        kstash::prefix_hasher hasher(toks_in.data(), toks_in.size());
+
+        kstash::candidate cand;
+        std::string why;
+        if (!kstash::find_best_state(kv_stash_dir, kv_stash_digest, hasher, toks_in.size(), cand, &why)) {
+            SLT_INF(slot, "kv stash: no matching state for %zu incoming tokens (%s), full re-prefill will run\n",
+                    toks_in.size(), why.empty() ? "new conversation or geometry change" : why.c_str());
+            return;
+        }
+
+        SLT_INF(slot, "kv stash: matching state %lld/%zu tokens%s, restoring '%s'\n",
+                (long long) cand.tag.n_tokens, toks_in.size(),
+                cand.tag.n_tokens > (int64_t) toks_in.size() ? " (superset, prefix-verified)" : "",
+                cand.state_path.c_str());
+
+        size_t nread = 0;
+        try {
+            size_t n_packed = 0;
+            llama_tokens packed;
+            nread = llama_state_seq_load_file(ctx_tgt, cand.state_path.c_str(), slot.id, nullptr, 0, &n_packed);
+            if (nread != 0) {
+                packed.resize(std::max<size_t>(1, n_packed));
+                nread = llama_state_seq_load_file(ctx_tgt, cand.state_path.c_str(), slot.id, packed.data(), packed.size(), &n_packed);
+            }
+            if (nread == 0) {
+                throw std::runtime_error("no valid llama state in file");
+            }
+            packed.resize(n_packed);
+
+            server_tokens restored = server_tokens::deserialize(packed, mctx != nullptr);
+
+            if (restored.size() > (size_t) slot.n_ctx) {
+                throw std::runtime_error("restored prompt does not fit in the slot context");
+            }
+
+            if (!restored.validate(ctx_tgt)) {
+                throw std::runtime_error("invalid tokens in the state file");
+            }
+
+            slot.prompt.clear();
+            slot.prompt.tokens = std::move(restored);
+        } catch (const std::exception & err) {
+            slot.prompt_clear();
+            SLT_WRN(slot, "kv stash: restore failed: %s\n", err.what());
+            return;
+        }
+
+        // the file layout matches the slot save/restore flow: checkpoints + draft
+        const size_t nread_ckpt = load_slot_checkpoints(cand.state_path, nread, slot);
+        const size_t nread_dft  = load_slot_draft(cand.state_path, nread + nread_ckpt, slot);
+
+        SLT_INF(slot, "kv stash: restored %d tokens (%.2f MiB state, %.2f MiB ckpt, %.2f MiB draft, restore took %.2f ms)\n",
+                (int) slot.prompt.tokens.size(),
+                nread / (1024.0 * 1024.0), nread_ckpt / (1024.0 * 1024.0), nread_dft / (1024.0 * 1024.0),
+                (ggml_time_us() - t_start) / 1000.0);
+    }
+
+    // ----------------------------------------------------------------------
+
 
     std::vector<common_adapter_lora_info> construct_lora_list(const std::map<int, float> & config) const {
         std::vector<common_adapter_lora_info> output = params_base.lora_adapters; // copy
