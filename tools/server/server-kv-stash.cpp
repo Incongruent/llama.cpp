@@ -1,5 +1,6 @@
 #include "server-kv-stash.h"
 
+#include "common.h"
 #include "json.h"
 
 #include <algorithm>
@@ -160,6 +161,15 @@ bool read_token_file(const std::string & path, std::vector<llama_token> & out, s
     }
 }
 
+size_t first_mismatch_index(const llama_token * a, const llama_token * b, size_t n) {
+    for (size_t i = 0; i < n; ++i) {
+        if (a[i] != b[i]) {
+            return i;
+        }
+    }
+    return n;
+}
+
 bool find_best_state(const std::string & dir, const std::string & digest,
                      const prefix_hasher & hasher, size_t n_incoming, candidate & out,
                      std::string * note) {
@@ -207,15 +217,43 @@ bool find_best_state(const std::string & dir, const std::string & digest,
     });
 
     size_t n_refused_superset = 0;
+    size_t n_refused_hashfit  = 0;
+
+    // fork A59 phase-1 (instrumentation, no matching-rule change): capture
+    // the first-mismatch index for the longest candidate that reaches the
+    // token comparison in each refusal class, so the refusal note can
+    // classify the divergence (index 0 = client-side re-serialization,
+    // unsalvageable by any disk state; index > 0 = interior divergence,
+    // salvageable by checkpoint restore in phase 2)
+    struct refusal_mm {
+        bool        have    = false; // a candidate of this class reached the compare
+        bool        scanned = false; // a mismatch index was computed
+        size_t      idx     = 0;
+        int64_t     n_saved = 0;
+        std::string name;
+    };
+    refusal_mm mm_sup;  // longest saved-longer candidate that reached the prefix check
+    refusal_mm mm_hash; // longest saved-fits candidate whose prefix hash refused
 
     for (const auto & c : cands) {
         const size_t n = (size_t) c.tag.n_tokens;
         if (n <= n_incoming) {
             // saved stream fits inside the incoming prompt: exact-verify the
-            // shared prefix (hash of the first n incoming tokens)
+            // shared prefix (hash of the first n saved incoming tokens)
             if (hex64(hasher.prefix_hash(n)) == c.tag.conv_hash) {
                 out = c;
                 return true;
+            }
+            n_refused_hashfit++;
+            if (!mm_hash.have) {
+                mm_hash.have    = true;
+                mm_hash.n_saved = (int64_t) n;
+                mm_hash.name    = fs::path(c.state_path).filename().string();
+                std::vector<llama_token> saved;
+                if (read_token_file(c.state_path + ".tokens", saved, n)) {
+                    mm_hash.idx     = first_mismatch_index(saved.data(), hasher.data(), n);
+                    mm_hash.scanned = true;
+                }
             }
             continue;
         }
@@ -235,14 +273,50 @@ bool find_best_state(const std::string & dir, const std::string & digest,
         }
         if (n_incoming == 0 || std::memcmp(saved.data(), hasher.data(), n_incoming * sizeof(llama_token)) != 0) {
             n_refused_superset++;
+            if (!mm_sup.have && n_incoming > 0) {
+                // single O(n) scan over the compare just performed; the
+                // accept path above stays a plain memcmp
+                mm_sup.idx     = first_mismatch_index(saved.data(), hasher.data(), n_incoming);
+                mm_sup.have    = true;
+                mm_sup.scanned = true;
+                mm_sup.n_saved = (int64_t) n;
+                mm_sup.name    = fs::path(c.state_path).filename().string();
+            }
             continue;
         }
         out = c;
         return true;
     }
 
-    if (note != nullptr && n_refused_superset > 0) {
-        *note = std::to_string(n_refused_superset) + " longer state(s) refused: incoming prompt is not their token prefix";
+    if (note != nullptr && (n_refused_superset > 0 || n_refused_hashfit > 0)) {
+        auto verdict = [](size_t idx) -> std::string {
+            return idx == 0
+                ? std::string("verdict: token-0 divergence - unsalvageable by disk stash (client-side token-stream re-serialization)")
+                : string_format("verdict: interior divergence at token %zu - salvageable by checkpoint restore (A59 phase 2)", idx);
+        };
+        std::string s;
+        if (n_refused_superset > 0) {
+            s += string_format("%zu longer state(s) refused", n_refused_superset);
+            if (mm_sup.scanned) {
+                s += string_format(": first mismatch at token %zu of longest prefix-checked candidate (%lld tokens, %s); %s",
+                        mm_sup.idx, (long long) mm_sup.n_saved, mm_sup.name.c_str(), verdict(mm_sup.idx).c_str());
+            } else {
+                s += " (no prefix check reached: missing/corrupt token companion or companion hash mismatch)";
+            }
+        }
+        if (n_refused_hashfit > 0) {
+            if (!s.empty()) {
+                s += "; ";
+            }
+            s += string_format("%zu shorter state(s) hash-refused", n_refused_hashfit);
+            if (mm_hash.scanned) {
+                s += string_format(": first mismatch at token %zu of longest hash-refused candidate (%lld tokens, %s); %s",
+                        mm_hash.idx, (long long) mm_hash.n_saved, mm_hash.name.c_str(), verdict(mm_hash.idx).c_str());
+            } else {
+                s += " (no token companion to scan for the mismatch index)";
+            }
+        }
+        *note = s;
     }
     return false;
 }
