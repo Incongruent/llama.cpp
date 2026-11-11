@@ -429,6 +429,13 @@ extern "C" {
         struct llama_sampler_seq_config * samplers;
         size_t                            n_samplers;
 
+        // fused gated delta net path for hybrid-recurrent models (A23):
+        // NULL = "on"; "off-ch" routes prefill through the graph-chunking path (decode stays fused),
+        // "off-all" uses the unfused paths for both phases, "auto" = "off-ch" on GPU devices
+        // with compute capability < 7.0 (the fused kernel falls back to a token-serial scan there).
+        // must point to a string that outlives the context creation
+        const char * fused_gdn;
+
         // a source/target/parent context
         // can be utilized in various ways, for example by sharing results or llama_memory between 2 contexts
         struct llama_context * ctx_other;

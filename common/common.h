@@ -655,6 +655,12 @@ struct common_params {
     std::string kv_stash_dir        = "";    // directory holding the saved state files
     int32_t     kv_stash_limit_mib  = 16384; // prune the stash after each save (0 = no limit)
 
+    // fused gated delta net path (hybrid-recurrent models, A23):
+    // "on" (default), "off-ch" (prefill takes the graph-chunking path, decode stays fused),
+    // "off-all", "auto" (off-ch when any GPU device has cc < 7.0, where the fused kernel
+    // falls back to a token-serial scan over n_tokens)
+    std::string fused_gdn = "on";
+
     // llama-connect params
     bool        server_connect      = false;
     std::string server_connect_code = "";

@@ -20,6 +20,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 
 //
@@ -595,6 +596,35 @@ llama_context::llama_context(
                 }
                 ev_ubatch_fences.push_back({backend.get(), std::move(event)});
             }
+        }
+
+        // A23: fused-GDN path selection. The fused GDN kernel requires cc >= 7.0
+        // (gated-delta-net-mma.cu rejects older devices, and the fused fallback is a
+        // token-serial scan over n_tokens), so route prefill through the graph-chunking
+        // path on such devices instead.
+        const std::string_view fgdn = params.fused_gdn ? params.fused_gdn : "on";
+        if (fgdn != "on") {
+            if (fgdn == "off-ch" || fgdn == "off-all") {
+                cparams.fused_gdn_ch = false;
+            }
+            if (fgdn == "off-all") {
+                cparams.fused_gdn_ar = false;
+            } else if (fgdn == "auto") {
+                for (auto & backend : backends) {
+                    auto * dev = ggml_backend_get_device(backend.get());
+                    if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+                        continue;
+                    }
+                    ggml_backend_dev_props props = {};
+                    ggml_backend_dev_get_props(dev, &props);
+                    if (props.cc > 0 && props.cc < 0x70) { // Volta = cc 7.0 = 0x70 (0x100*major + 0x10*minor)
+                        cparams.fused_gdn_ch = false;
+                        break;
+                    }
+                }
+            }
+            LLAMA_LOG_INFO("%s: fused_gdn mode '%.*s' -> fused_gdn_ar=%d fused_gdn_ch=%d\n",
+                    __func__, (int) fgdn.size(), fgdn.data(), cparams.fused_gdn_ar, cparams.fused_gdn_ch);
         }
 
         if (cparams.moe_cache_size > 0) {
@@ -4290,6 +4320,7 @@ llama_context_params llama_context_default_params() {
         /*.kv_unified                  =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
+        /*.fused_gdn                   =*/ nullptr,
         /*.ctx_other                   =*/ nullptr,
     };
 

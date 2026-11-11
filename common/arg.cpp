@@ -1690,6 +1690,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_STASH_LIMIT_MIB").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--fgdn"}, "{on,off-ch,off-all,auto}",
+        "fused Gated Delta Net path for hybrid-recurrent models:\n"
+        "- on (default): fused kernel for both decode and prefill\n"
+        "- off-ch: prefill takes the graph-chunking path (cumsum/tri/matmul), decode stays fused\n"
+        "- off-all: both phases take the unfused paths\n"
+        "- auto: off-ch when any GPU device has compute capability < 7.0 (the fused kernel falls back to a token-serial scan over n_tokens there), else on",
+        [](common_params & params, const std::string & value) {
+            if (value != "on" && value != "off-ch" && value != "off-all" && value != "auto") {
+                throw std::invalid_argument("invalid value");
+            }
+            params.fused_gdn = value;
+        }
+    ).set_env("LLAMA_ARG_FGDN"));
+    add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
         "use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)",

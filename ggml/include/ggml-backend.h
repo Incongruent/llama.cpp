@@ -181,6 +181,8 @@ extern "C" {
         const char * device_id;
         // device capabilities
         struct ggml_backend_dev_caps caps;
+        // device compute capability, 0 = unknown (CUDA: major*0x100 + minor*0x10)
+        int cc;
     };
 
     GGML_API const char *                  ggml_backend_dev_name(ggml_backend_dev_t device);
