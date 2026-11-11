@@ -47,6 +47,10 @@ bool write_token_file(const std::string & path, const llama_token * data, size_t
 // read + size-check a companion token file (expect_n = sidecar n_tokens)
 bool read_token_file(const std::string & path, std::vector<llama_token> & out, size_t expect_n);
 
+// first token index at which the two streams differ over the first n tokens
+// (returns n when identical); single O(n) scan, used on the refusal path only
+size_t first_mismatch_index(const llama_token * a, const llama_token * b, size_t n);
+
 // incremental FNV-1a over token ids, so prefixes can be hashed cheaply
 struct prefix_hasher {
     prefix_hasher(const llama_token * data, size_t n_tokens) : data_(data), n_tokens_(n_tokens) {}
@@ -74,7 +78,12 @@ struct candidate {
 // accepted only when the incoming stream is an exact token prefix of the
 // saved stream, verified against the .tokens companion. candidates without
 // a companion token file are never restored when longer than the incoming
-// stream. when nothing verifies, note (if given) describes why.
+// stream. when nothing verifies, note (if given) describes why, including
+// (fork A59 phase 1) the first-mismatch token index of the longest
+// prefix-checked or hash-refused candidate plus a salvage verdict: index 0
+// marks token-0 divergence (unsalvageable by any disk state - the fix is
+// client-side token-stream stability), index > 0 marks interior divergence
+// (salvageable by checkpoint restore, A59 phase 2).
 bool find_best_state(const std::string & dir, const std::string & digest,
                      const prefix_hasher & hasher, size_t n_incoming, candidate & out,
                      std::string * note = nullptr);

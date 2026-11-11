@@ -348,6 +348,10 @@ set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-downlo
 
 llama_build_and_test(test-arg-parser.cpp  LABEL behavior)
 llama_build_and_test(test-model-resolution.cpp  LABEL behavior)
+# fork A39/A59: offline KV-stash matcher tests (no model, no GPU)
+llama_build(test-kv-stash.cpp ${PROJECT_SOURCE_DIR}/tools/server/server-kv-stash.cpp)
+target_include_directories(test-kv-stash PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+llama_test(test-kv-stash LABEL behavior)
 # the test serves its repos from an httplib server, and the library links it privately
 target_link_libraries(test-model-resolution PRIVATE cpp-httplib)
 
