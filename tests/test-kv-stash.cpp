@@ -90,6 +90,36 @@ static void test_first_mismatch_index() {
     CHECK(kstash::first_mismatch_index(a.data(), b_same.data(), 0) == 0); // empty scan -> 0
 }
 
+// fork A39.1: media detection drives the stash hard-refusal on both sides.
+// The collision class (same text, different image) is closed because BOTH
+// streams carry media placeholders -> BOTH are excluded (dump + consult),
+// so neither can ever restore the other's KV.
+static void test_stream_has_media() {
+    const std::vector<llama_token> text_only  = {101, 102, 103};
+    const std::vector<llama_token> empty      = {};
+    const std::vector<llama_token> img_one    = {101, 102, LLAMA_TOKEN_NULL, 103};                   // 1 placeholder
+    const std::vector<llama_token> img_two    = {101, 102, LLAMA_TOKEN_NULL, LLAMA_TOKEN_NULL, 103}; // 2 placeholders
+    const std::vector<llama_token> img_twoimg = {101, LLAMA_TOKEN_NULL, 102, LLAMA_TOKEN_NULL, 103}; // 2 images
+
+    CHECK(!kstash::stream_has_media(text_only.data(), text_only.size())); // text-only: stashing proceeds as before
+    CHECK(!kstash::stream_has_media(empty.data(), empty.size()));         // empty: false (guard order: empty check first)
+    CHECK(kstash::stream_has_media(img_one.data(), img_one.size()));
+    CHECK(kstash::stream_has_media(img_two.data(), img_two.size()));
+    CHECK(kstash::stream_has_media(img_twoimg.data(), img_twoimg.size()));
+
+    // same text, different images: text-token streams are identical...
+    {
+        std::vector<llama_token> t_a, t_b;
+        for (llama_token t : img_one)    if (t != LLAMA_TOKEN_NULL) t_a.push_back(t);
+        for (llama_token t : img_twoimg) if (t != LLAMA_TOKEN_NULL) t_b.push_back(t);
+        CHECK(t_a == t_b);
+        CHECK(kstash::hash_tokens(t_a.data(), t_a.size()) == kstash::hash_tokens(t_b.data(), t_b.size())); // ...conv_hash collides
+    }
+    // ...but both raw streams carry media -> both hard-refused -> no restore possible
+    CHECK(kstash::stream_has_media(img_one.data(), img_one.size()));
+    CHECK(kstash::stream_has_media(img_twoimg.data(), img_twoimg.size()));
+}
+
 static void test_accept_superset_prefix(const fs::path & dir) {
     make_state(dir, DIGEST, {1, 2, 3, 4, 5, 6, 7, 8});
     consult_result r = consult(dir, {1, 2, 3, 4});
@@ -219,6 +249,7 @@ int main() {
     };
 
     test_first_mismatch_index();
+    test_stream_has_media();
     run("accept_superset",      test_accept_superset_prefix);
     run("accept_shorter",       test_accept_shorter_fit);
     run("refuse_sup_int",       test_refuse_superset_interior);
