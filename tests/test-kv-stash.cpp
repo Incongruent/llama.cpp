@@ -3,8 +3,16 @@
 // The A59 phase-1 assertions cover the enriched refusal note: first-mismatch
 // token index of the longest prefix-checked / hash-refused candidate plus the
 // salvage verdict (token-0 = unsalvageable by any disk state, interior =
-// salvageable by checkpoint restore in phase 2). The matching rules themselves
-// (accept paths, refusals, digest filter) are regression-guarded here too.
+// salvageable). The matching rules themselves (accept paths, refusals, digest
+// filter) are regression-guarded here too.
+//
+// fork A59 phase 2: interior divergence is no longer a pure refusal. when no
+// candidate fully verifies, the matcher now returns the candidate carrying the
+// longest verified shared prefix, flagged salvage=true with
+// salvage_prefix = that length (token-0 divergence stays unsalvageable,
+// salvage_prefix 0). these tests pin that contract: salvage is returned for
+// interior divergence, max-verified-prefix wins across candidates, and a full
+// (superset-prefix) match still beats any salvage.
 
 #include "server-kv-stash.h"
 
@@ -135,16 +143,18 @@ static void test_accept_shorter_fit(const fs::path & dir) {
     CHECK(r.cand.tag.n_tokens == 4);
 }
 
-static void test_refuse_superset_interior(const fs::path & dir) {
+// fork A59 phase 2: interior divergence (saved longer, verified prefix then
+// diverge) is salvaged, not refused - the longest verified prefix [0, F) is
+// returned flagged salvage so the caller restores it and re-prefills the tail.
+static void test_salvage_superset_interior(const fs::path & dir) {
     make_state(dir, DIGEST, {1, 2, 3, 4, 5, 6, 7, 8});
     consult_result r = consult(dir, {1, 2, 3, 9, 4});
-    CHECK(!r.found);
-    CHECK_CONTAINS(r.note, "1 longer state(s) refused");
-    CHECK_CONTAINS(r.note, "first mismatch at token 3");
-    CHECK_CONTAINS(r.note, "interior divergence at token 3");
-    CHECK_CONTAINS(r.note, "salvageable by checkpoint restore");
-    CHECK_CONTAINS(r.note, "kvst_"); // candidate name is carried in the note
-    CHECK_NOT_CONTAINS(r.note, "unsalvageable");
+    CHECK(r.found);
+    CHECK(r.cand.salvage);
+    CHECK(r.cand.salvage_prefix == 3);   // verified prefix {1, 2, 3}, diverge at 3
+    CHECK(r.cand.tag.n_tokens == 8);
+    CHECK_CONTAINS(r.note, "salvaging verified 3-token prefix");
+    CHECK_CONTAINS(r.note, "re-prefill from token 3");
 }
 
 static void test_refuse_superset_token0(const fs::path & dir) {
@@ -182,14 +192,17 @@ static void test_refuse_superset_companion_hash_mismatch(const fs::path & dir) {
     CHECK_NOT_CONTAINS(r.note, "first mismatch");
 }
 
-static void test_refuse_hashfit_interior(const fs::path & dir) {
+// fork A59 phase 2: interior divergence on the hash-fit path (saved shorter,
+// prefix hash refused) is likewise salvaged with the verified prefix [0, F).
+static void test_salvage_hashfit_interior(const fs::path & dir) {
     make_state(dir, DIGEST, {1, 2, 3, 4});
     consult_result r = consult(dir, {1, 2, 9, 4, 5, 6});
-    CHECK(!r.found);
-    CHECK_CONTAINS(r.note, "1 shorter state(s) hash-refused");
-    CHECK_CONTAINS(r.note, "first mismatch at token 2");
-    CHECK_CONTAINS(r.note, "interior divergence at token 2");
-    CHECK_CONTAINS(r.note, "salvageable by checkpoint restore");
+    CHECK(r.found);
+    CHECK(r.cand.salvage);
+    CHECK(r.cand.salvage_prefix == 2);   // verified prefix {1, 2}, diverge at 2
+    CHECK(r.cand.tag.n_tokens == 4);
+    CHECK_CONTAINS(r.note, "salvaging verified 2-token prefix");
+    CHECK_CONTAINS(r.note, "re-prefill from token 2");
 }
 
 static void test_refuse_hashfit_no_companion(const fs::path & dir) {
@@ -199,6 +212,32 @@ static void test_refuse_hashfit_no_companion(const fs::path & dir) {
     CHECK_CONTAINS(r.note, "1 shorter state(s) hash-refused");
     CHECK_CONTAINS(r.note, "no token companion to scan");
     CHECK_NOT_CONTAINS(r.note, "first mismatch");
+}
+
+// fork A59 phase 2: the salvage is the candidate with the LONGEST verified
+// shared prefix, not the longest state. here the 8-token state diverges at
+// token 0 (F=0) while the 5-token state diverges at token 2 (F=2) -> the
+// 5-token state wins.
+static void test_salvage_max_prefix_wins(const fs::path & dir) {
+    make_state(dir, DIGEST, {9, 2, 3, 4, 5, 6, 7, 8}); // 8 tok, token-0 divergence (F=0)
+    make_state(dir, DIGEST, {1, 2, 9, 4, 5});          // 5 tok, interior at 2 (F=2)
+    consult_result r = consult(dir, {1, 2, 3, 4, 5, 6, 7});
+    CHECK(r.found);
+    CHECK(r.cand.salvage);
+    CHECK(r.cand.salvage_prefix == 2);
+    CHECK(r.cand.tag.n_tokens == 5); // the 5-token state, not the longer 8-token one
+}
+
+// fork A59 phase 2: a full (superset-prefix) match always wins over a salvage,
+// even when a longer state carries a salvageable interior divergence.
+static void test_full_match_beats_salvage(const fs::path & dir) {
+    make_state(dir, DIGEST, {1, 2, 9, 4, 5, 6, 7, 8}); // 8 tok, interior at 2 (F=2)
+    make_state(dir, DIGEST, {1, 2, 3, 4, 5});          // 5 tok, exact superset-prefix fit
+    consult_result r = consult(dir, {1, 2, 3, 4, 5, 6, 7});
+    CHECK(r.found);
+    CHECK(!r.cand.salvage);
+    CHECK(r.cand.tag.n_tokens == 5);
+    CHECK(r.note.empty());
 }
 
 // the longest candidate refuses, the loop must continue to the next one
@@ -252,12 +291,14 @@ int main() {
     test_stream_has_media();
     run("accept_superset",      test_accept_superset_prefix);
     run("accept_shorter",       test_accept_shorter_fit);
-    run("refuse_sup_int",       test_refuse_superset_interior);
+    run("salvage_sup_int",      test_salvage_superset_interior);
     run("refuse_sup_t0",        test_refuse_superset_token0);
     run("refuse_sup_notok",     test_refuse_superset_no_companion);
     run("refuse_sup_badhash",   test_refuse_superset_companion_hash_mismatch);
-    run("refuse_hash_int",      test_refuse_hashfit_interior);
+    run("salvage_hash_int",     test_salvage_hashfit_interior);
     run("refuse_hash_notok",    test_refuse_hashfit_no_companion);
+    run("salvage_max_prefix",   test_salvage_max_prefix_wins);
+    run("fullmatch_beats_salv", test_full_match_beats_salvage);
     run("continue_after",       test_continue_after_refusal);
     run("digest_filter",        test_digest_filter);
     run("empty_missing",        test_empty_and_missing_dir);

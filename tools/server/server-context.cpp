@@ -2149,10 +2149,29 @@ private:
             return;
         }
 
-        SLT_INF(slot, "kv stash: matching state %lld/%zu tokens%s, restoring '%s'\n",
-                (long long) cand.tag.n_tokens, toks_in.size(),
-                cand.tag.n_tokens > (int64_t) toks_in.size() ? " (superset, prefix-verified)" : "",
-                cand.state_path.c_str());
+        // fork A59 phase 2: salvage-worthiness gate. a shallow shared prefix
+        // (in practice the shared BOS at F=1, which every state carries) does
+        // not pay for the MiB-scale state load; keep the cheap full re-prefill.
+        // full matches (cand.salvage == false) are never gated.
+        if (cand.salvage && cand.salvage_prefix < kstash::min_salvage_prefix) {
+            SLT_INF(slot, "kv stash: salvage rejected: prefix %lld < %lld min, full re-prefill is cheaper (%s)\n",
+                    (long long) cand.salvage_prefix, (long long) kstash::min_salvage_prefix,
+                    why.empty() ? "interior divergence below the salvage gate" : why.c_str());
+            return;
+        }
+
+        {
+            std::string restore_note;
+            if (cand.salvage) {
+                restore_note = string_format(" (salvage: divergence at token %lld, re-prefill the tail)", (long long) cand.salvage_prefix);
+            } else if (cand.tag.n_tokens > (int64_t) toks_in.size()) {
+                restore_note = " (superset, prefix-verified)";
+            }
+            SLT_INF(slot, "kv stash: %s state %lld/%zu tokens%s, restoring '%s'\n",
+                    cand.salvage ? "salvaging" : "matching",
+                    (long long) cand.tag.n_tokens, toks_in.size(), restore_note.c_str(),
+                    cand.state_path.c_str());
+        }
 
         size_t nread = 0;
         try {
@@ -2178,6 +2197,20 @@ private:
                 throw std::runtime_error("invalid tokens in the state file");
             }
 
+            // fork A59 phase 2: interior-divergence salvage. the saved stream
+            // and the incoming prompt share a verified token prefix [0, F) and
+            // diverge at F; keep that prefix and let the slot re-prefill only
+            // [F, n_incoming) instead of the whole prompt. truncate both the
+            // freshly loaded KV and the token stream to F: the processing loop
+            // recomputes n_past = get_common_prefix = F and continues from there
+            // (for the full-attention profile pos_min 0 < pos_min_thold F, so no
+            // checkpoint restore fires and the prefix KV is used as-is).
+            if (cand.salvage) {
+                const llama_pos F = (llama_pos) cand.salvage_prefix;
+                llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, F, -1);
+                restored.keep_first((size_t) F);
+            }
+
             slot.prompt.clear();
             slot.prompt.tokens = std::move(restored);
         } catch (const std::exception & err) {
@@ -2186,12 +2219,22 @@ private:
             return;
         }
 
-        // the file layout matches the slot save/restore flow: checkpoints + draft
-        const size_t nread_ckpt = load_slot_checkpoints(cand.state_path, nread, slot);
-        const size_t nread_dft  = load_slot_draft(cand.state_path, nread + nread_ckpt, slot);
+        // the file layout matches the slot save/restore flow: checkpoints + draft.
+        // a salvaged (truncated) state drops both: the saved checkpoints/draft
+        // reference the dropped [F, N) tail and are invalid for the re-prefilled
+        // prefix, so they must not be loaded (the processing loop would also
+        // erase the now-out-of-range checkpoints).
+        size_t nread_ckpt = 0;
+        size_t nread_dft  = 0;
+        if (!cand.salvage) {
+            nread_ckpt = load_slot_checkpoints(cand.state_path, nread, slot);
+            nread_dft  = load_slot_draft(cand.state_path, nread + nread_ckpt, slot);
+        }
 
-        SLT_INF(slot, "kv stash: restored %d tokens (%.2f MiB state, %.2f MiB ckpt, %.2f MiB draft, restore took %.2f ms)\n",
+        const char * salvage_note = cand.salvage ? " (salvaged prefix, dropped ckpt/draft)" : "";
+        SLT_INF(slot, "kv stash: restored %d tokens%s (%.2f MiB state, %.2f MiB ckpt, %.2f MiB draft, restore took %.2f ms)\n",
                 (int) slot.prompt.tokens.size(),
+                salvage_note,
                 nread / (1024.0 * 1024.0), nread_ckpt / (1024.0 * 1024.0), nread_dft / (1024.0 * 1024.0),
                 (ggml_time_us() - t_start) / 1000.0);
     }

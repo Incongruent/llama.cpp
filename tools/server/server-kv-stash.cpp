@@ -244,6 +244,21 @@ bool find_best_state(const std::string & dir, const std::string & digest,
     refusal_mm mm_sup;  // longest saved-longer candidate that reached the prefix check
     refusal_mm mm_hash; // longest saved-fits candidate whose prefix hash refused
 
+    // fork A59 phase 2: track the refused candidate carrying the longest
+    // verified shared prefix with the incoming stream (interior divergence).
+    // returned as a salvage candidate when no candidate fully verifies, so the
+    // caller restores that prefix and re-prefills the tail instead of the whole
+    // prompt. only prefixes of length > 0 are salvageable (token-0 divergence
+    // is unsalvageable by any disk state).
+    candidate best_salvage;
+    int64_t   best_salvage_F = 0;
+    const auto consider_salvage = [&best_salvage, &best_salvage_F](const candidate & c, size_t fmm) {
+        if ((int64_t) fmm > best_salvage_F) {
+            best_salvage_F = (int64_t) fmm;
+            best_salvage   = c;
+        }
+    };
+
     for (const auto & c : cands) {
         const size_t n = (size_t) c.tag.n_tokens;
         if (n <= n_incoming) {
@@ -262,6 +277,7 @@ bool find_best_state(const std::string & dir, const std::string & digest,
                 if (read_token_file(c.state_path + ".tokens", saved, n)) {
                     mm_hash.idx     = first_mismatch_index(saved.data(), hasher.data(), n);
                     mm_hash.scanned = true;
+                    consider_salvage(c, mm_hash.idx);
                 }
             }
             continue;
@@ -282,14 +298,20 @@ bool find_best_state(const std::string & dir, const std::string & digest,
         }
         if (n_incoming == 0 || std::memcmp(saved.data(), hasher.data(), n_incoming * sizeof(llama_token)) != 0) {
             n_refused_superset++;
-            if (!mm_sup.have && n_incoming > 0) {
+            if (n_incoming > 0) {
                 // single O(n) scan over the compare just performed; the
                 // accept path above stays a plain memcmp
-                mm_sup.idx     = first_mismatch_index(saved.data(), hasher.data(), n_incoming);
-                mm_sup.have    = true;
-                mm_sup.scanned = true;
-                mm_sup.n_saved = (int64_t) n;
-                mm_sup.name    = fs::path(c.state_path).filename().string();
+                const size_t fmm = first_mismatch_index(saved.data(), hasher.data(), n_incoming);
+                if (!mm_sup.have) {
+                    mm_sup.idx     = fmm;
+                    mm_sup.have    = true;
+                    mm_sup.scanned = true;
+                    mm_sup.n_saved = (int64_t) n;
+                    mm_sup.name    = fs::path(c.state_path).filename().string();
+                }
+                // fork A59 phase 2: every saved-longer refusal carries a
+                // verified prefix [0, fmm); keep the longest across candidates
+                consider_salvage(c, fmm);
             }
             continue;
         }
@@ -297,11 +319,26 @@ bool find_best_state(const std::string & dir, const std::string & digest,
         return true;
     }
 
+    // fork A59 phase 2: no candidate fully verified, but one carries a
+    // verified shared prefix of length > 0 (interior divergence). return it as
+    // a salvage candidate so the caller restores that prefix and re-prefills
+    // the tail instead of the whole prompt.
+    if (best_salvage_F > 0) {
+        out = best_salvage;
+        out.salvage        = true;
+        out.salvage_prefix = best_salvage_F;
+        if (note != nullptr) {
+            *note = string_format("interior divergence: no full match, salvaging verified %lld-token prefix (re-prefill from token %lld)",
+                    (long long) best_salvage_F, (long long) best_salvage_F);
+        }
+        return true;
+    }
+
     if (note != nullptr && (n_refused_superset > 0 || n_refused_hashfit > 0)) {
         auto verdict = [](size_t idx) -> std::string {
             return idx == 0
                 ? std::string("verdict: token-0 divergence - unsalvageable by disk stash (client-side token-stream re-serialization)")
-                : string_format("verdict: interior divergence at token %zu - salvageable by checkpoint restore (A59 phase 2)", idx);
+                : string_format("verdict: interior divergence at token %zu - salvageable (A59 phase 2)", idx);
         };
         std::string s;
         if (n_refused_superset > 0) {

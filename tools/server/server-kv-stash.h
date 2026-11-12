@@ -78,7 +78,24 @@ private:
 struct candidate {
     std::string state_path;
     state_tag   tag;
+    // fork A59 phase 2: set when no candidate fully verified but one carries a
+    // verified token prefix [0, salvage_prefix) shared with the incoming
+    // stream (interior divergence). the caller loads that state, truncates the
+    // KV and token stream to salvage_prefix and re-prefills the tail.
+    bool        salvage        = false;
+    int64_t     salvage_prefix = 0;
 };
+
+// fork A59 phase 2: minimum verified-prefix depth for a salvage restore.
+// a salvaged state pays a full-state load (live-measured 4049 MiB / 5.97 s on
+// the stash disk ~= 679 MiB/s) to skip salvage_prefix tokens of re-prefill
+// (~4.2 ms/tok in prod). breakeven is F ~= state_tokens/79, so the largest
+// production states (117k tok) break even near F=1500; 4096 is safely above
+// breakeven for any state size and matches half the checkpoint spacing.
+// below the gate the caller keeps the cheap full re-prefill (a shared-BOS
+// F=1 salvage against the 117k state was live-verified as a pessimization:
+// 5.97 s load to skip a 20-tok tail).
+constexpr int64_t min_salvage_prefix = 4096;
 
 // pick the best saved state for an incoming token stream (best = largest
 // verified restored prefix, ranked by n_tokens across candidates with a
@@ -88,12 +105,18 @@ struct candidate {
 // accepted only when the incoming stream is an exact token prefix of the
 // saved stream, verified against the .tokens companion. candidates without
 // a companion token file are never restored when longer than the incoming
-// stream. when nothing verifies, note (if given) describes why, including
-// (fork A59 phase 1) the first-mismatch token index of the longest
+// stream. when no candidate fully verifies, (fork A59 phase 2) the candidate
+// with the longest verified shared prefix is still returned, flagged
+// salvage=true with salvage_prefix = that prefix length (0 only when the
+// divergence is at token 0, i.e. unsalvageable); the caller restores that
+// prefix and re-prefills the tail, gating shallow salvages (salvage_prefix
+// below kstash::min_salvage_prefix) back to a full re-prefill. note (if
+// given) describes the refusal,
+// including (fork A59 phase 1) the first-mismatch token index of the longest
 // prefix-checked or hash-refused candidate plus a salvage verdict: index 0
 // marks token-0 divergence (unsalvageable by any disk state - the fix is
 // client-side token-stream stability), index > 0 marks interior divergence
-// (salvageable by checkpoint restore, A59 phase 2).
+// (salvageable, A59 phase 2).
 bool find_best_state(const std::string & dir, const std::string & digest,
                      const prefix_hasher & hasher, size_t n_incoming, candidate & out,
                      std::string * note = nullptr);
