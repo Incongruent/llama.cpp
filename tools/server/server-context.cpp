@@ -2163,7 +2163,7 @@ private:
         {
             std::string restore_note;
             if (cand.salvage) {
-                restore_note = string_format(" (salvage: divergence at token %lld, re-prefill the tail)", (long long) cand.salvage_prefix);
+                restore_note = string_format(" (salvage: divergence at token %lld, tail re-prefill via checkpoint rollback)", (long long) cand.salvage_prefix);
             } else if (cand.tag.n_tokens > (int64_t) toks_in.size()) {
                 restore_note = " (superset, prefix-verified)";
             }
@@ -2197,19 +2197,25 @@ private:
                 throw std::runtime_error("invalid tokens in the state file");
             }
 
-            // fork A59 phase 2: interior-divergence salvage. the saved stream
-            // and the incoming prompt share a verified token prefix [0, F) and
-            // diverge at F; keep that prefix and let the slot re-prefill only
-            // [F, n_incoming) instead of the whole prompt. truncate both the
-            // freshly loaded KV and the token stream to F: the processing loop
-            // recomputes n_past = get_common_prefix = F and continues from there
-            // (for the full-attention profile pos_min 0 < pos_min_thold F, so no
-            // checkpoint restore fires and the prefix KV is used as-is).
-            if (cand.salvage) {
-                const llama_pos F = (llama_pos) cand.salvage_prefix;
-                llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, F, -1);
-                restored.keep_first((size_t) F);
-            }
+            // fork A42/A59 convergence: interior-divergence salvage. the saved
+            // stream and the incoming prompt share a verified token prefix
+            // [0, F) and diverge at F. keep the FULL restored KV and token
+            // stream and let the processing loop pick the rollback point:
+            // n_past = get_common_prefix = F, then
+            //  - hybrid/recurrent: the loaded checkpoints are searched newest-
+            //    first for pos_min < F (a usable checkpoint covers exactly the
+            //    shared prefix, pos_min+1 <= F) and the largest one is restored
+            //    (PARTIAL_ONLY replants the 48 recurrent layers + the draft
+            //    spec state at that position), so the re-prefill is bounded by
+            //    [ckpt_pos+1, n_incoming); with no usable checkpoint the loop
+            //    falls back to the full re-prefill (do_reset).
+            //  - full-attention: pos_min 0 < pos_min_thold F skips the
+            //    checkpoint search and the prefix KV is used as-is, re-prefill
+            //    bounded by [F, n_incoming).
+            // truncating here instead (the pre-convergence behavior) forced the
+            // full re-prefill on every hybrid event: the recurrent layers have
+            // no state at F without a checkpoint replant (live-measured net
+            // -(state load) on all deep events, report 2026-11-12-1530).
 
             slot.prompt.clear();
             slot.prompt.tokens = std::move(restored);
@@ -2220,18 +2226,18 @@ private:
         }
 
         // the file layout matches the slot save/restore flow: checkpoints + draft.
-        // a salvaged (truncated) state drops both: the saved checkpoints/draft
-        // reference the dropped [F, N) tail and are invalid for the re-prefilled
-        // prefix, so they must not be loaded (the processing loop would also
-        // erase the now-out-of-range checkpoints).
-        size_t nread_ckpt = 0;
+        // a salvaged state loads the checkpoint appendix (the processing loop
+        // rolls back to the largest checkpoint that covers the shared prefix,
+        // each entry carries its own target + draft + spec blobs) but skips
+        // the live draft state: it ends at the wrong branch position and the
+        // checkpoint restore replants the draft spec state itself.
+        size_t nread_ckpt = load_slot_checkpoints(cand.state_path, nread, slot);
         size_t nread_dft  = 0;
         if (!cand.salvage) {
-            nread_ckpt = load_slot_checkpoints(cand.state_path, nread, slot);
-            nread_dft  = load_slot_draft(cand.state_path, nread + nread_ckpt, slot);
+            nread_dft = load_slot_draft(cand.state_path, nread + nread_ckpt, slot);
         }
 
-        const char * salvage_note = cand.salvage ? " (salvaged prefix, dropped ckpt/draft)" : "";
+        const char * salvage_note = cand.salvage ? " (salvage: full state + checkpoints, tail re-prefill via checkpoint rollback)" : "";
         SLT_INF(slot, "kv stash: restored %d tokens%s (%.2f MiB state, %.2f MiB ckpt, %.2f MiB draft, restore took %.2f ms)\n",
                 (int) slot.prompt.tokens.size(),
                 salvage_note,

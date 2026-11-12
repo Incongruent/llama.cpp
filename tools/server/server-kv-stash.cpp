@@ -328,7 +328,7 @@ bool find_best_state(const std::string & dir, const std::string & digest,
         out.salvage        = true;
         out.salvage_prefix = best_salvage_F;
         if (note != nullptr) {
-            *note = string_format("interior divergence: no full match, salvaging verified %lld-token prefix (re-prefill from token %lld)",
+            *note = string_format("interior divergence: no full match, salvaging verified %lld-token prefix (tail re-prefill via checkpoint rollback)",
                     (long long) best_salvage_F, (long long) best_salvage_F);
         }
         return true;

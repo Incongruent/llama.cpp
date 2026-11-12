@@ -78,10 +78,12 @@ private:
 struct candidate {
     std::string state_path;
     state_tag   tag;
-    // fork A59 phase 2: set when no candidate fully verified but one carries a
-    // verified token prefix [0, salvage_prefix) shared with the incoming
-    // stream (interior divergence). the caller loads that state, truncates the
-    // KV and token stream to salvage_prefix and re-prefills the tail.
+    // fork A59 phase 2 (A42-converged): set when no candidate fully verified
+    // but one carries a verified token prefix [0, salvage_prefix) shared with
+    // the incoming stream (interior divergence). the caller loads the FULL
+    // state + checkpoint appendix and the processing loop rolls back to the
+    // largest checkpoint covering the shared prefix (hybrid) or uses the
+    // prefix KV as-is (full-attention), then re-prefills only the tail.
     bool        salvage        = false;
     int64_t     salvage_prefix = 0;
 };
@@ -108,9 +110,12 @@ constexpr int64_t min_salvage_prefix = 4096;
 // stream. when no candidate fully verifies, (fork A59 phase 2) the candidate
 // with the longest verified shared prefix is still returned, flagged
 // salvage=true with salvage_prefix = that prefix length (0 only when the
-// divergence is at token 0, i.e. unsalvageable); the caller restores that
-// prefix and re-prefills the tail, gating shallow salvages (salvage_prefix
-// below kstash::min_salvage_prefix) back to a full re-prefill. note (if
+// divergence is at token 0, i.e. unsalvageable); the caller restores the full
+// state and rolls back to the largest checkpoint covering the shared prefix
+// (A42 convergence - a truncated-prefix restore cannot work on hybrid models:
+// the recurrent layers have no state at the cut point), gating shallow
+// salvages (salvage_prefix below kstash::min_salvage_prefix) back to a full
+// re-prefill. note (if
 // given) describes the refusal,
 // including (fork A59 phase 1) the first-mismatch token index of the longest
 // prefix-checked or hash-refused candidate plus a salvage verdict: index 0

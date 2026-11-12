@@ -154,7 +154,7 @@ static void test_salvage_superset_interior(const fs::path & dir) {
     CHECK(r.cand.salvage_prefix == 3);   // verified prefix {1, 2, 3}, diverge at 3
     CHECK(r.cand.tag.n_tokens == 8);
     CHECK_CONTAINS(r.note, "salvaging verified 3-token prefix");
-    CHECK_CONTAINS(r.note, "re-prefill from token 3");
+    CHECK_CONTAINS(r.note, "tail re-prefill via checkpoint rollback");
 }
 
 static void test_refuse_superset_token0(const fs::path & dir) {
@@ -202,7 +202,7 @@ static void test_salvage_hashfit_interior(const fs::path & dir) {
     CHECK(r.cand.salvage_prefix == 2);   // verified prefix {1, 2}, diverge at 2
     CHECK(r.cand.tag.n_tokens == 4);
     CHECK_CONTAINS(r.note, "salvaging verified 2-token prefix");
-    CHECK_CONTAINS(r.note, "re-prefill from token 2");
+    CHECK_CONTAINS(r.note, "tail re-prefill via checkpoint rollback");
 }
 
 static void test_refuse_hashfit_no_companion(const fs::path & dir) {
