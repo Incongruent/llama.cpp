@@ -125,6 +125,22 @@ bool find_best_state(const std::string & dir, const std::string & digest,
 // a negative limit disables pruning; keep_path is never deleted
 void prune_dir(const std::string & dir, int64_t limit_bytes, const std::string & keep_path);
 
+// fork A40 phase-1: same-preset alternation trigger. the resident slot tail
+// (the previous conversation) is worth a fork-dump when the incoming prompt
+// forks out of it early: shared prefix `fork` below fork_frac of the tail
+// with a tail of at least min_tail tokens. exact tail growth (fork == tail)
+// and deep continuations (fork >= 90% of tail) are the same conversation
+// growing in-slot - no dump. exact 90% is not "below".
+struct fork_check {
+    size_t tail       = 0; // resident conversation length
+    size_t fork       = 0; // shared prefix with the incoming prompt
+    bool   should_dump = false;
+};
+
+fork_check check_fork_dump(const llama_token * tail_data, size_t n_tail,
+                           const llama_token * incoming_data, size_t n_incoming,
+                           size_t min_tail = 2048, double fork_frac = 0.9);
+
 // create the directory (and parents) if missing; returns false on error
 bool ensure_dir(const std::string & dir);
 

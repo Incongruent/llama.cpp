@@ -1141,6 +1141,51 @@ private:
 
     int64_t t_last_load_progress_ms = 0;
 
+    // fork A61: give in-flight generations a chance to unwind before the
+    // queue loop dies. terminate() can be observed while a decode is running;
+    // process_new_tasks then exits without draining pending tasks, slots stay
+    // in a processing state, and destroy()/kv_stash_dump_all() (IDLE-only)
+    // saves nothing - the "saved 0 states" busy-kill. Post a cancel for every
+    // busy slot and wait (bounded) for the loop thread to release them:
+    // release() keeps the prompt tokens, so the exit dump still persists the
+    // conversation. Slot reads here are racy-but-benign: they only observe an
+    // enum/pointer that the queue thread updates monotonically toward IDLE.
+    void cancel_inflight_for_exit(int64_t timeout_ms) {
+        if (kv_stash_enabled()) {
+            bool posted = false;
+            for (auto & slot : slots) {
+                if (slot.is_processing() && slot.task) {
+                    server_task task(SERVER_TASK_TYPE_CANCEL);
+                    task.id_target = slot.task->id;
+                    SRV_INF("kv stash exit: canceling in-flight task %d on slot %d before shutdown\n",
+                            slot.task->id, slot.id);
+                    queue_tasks.post(std::move(task));
+                    posted = true;
+                }
+            }
+
+            if (posted) {
+                const int64_t t_end = ggml_time_us() + timeout_ms * 1000;
+                while (ggml_time_us() < t_end) {
+                    bool busy = false;
+                    for (auto & slot : slots) {
+                        if (slot.is_processing()) {
+                            busy = true;
+                            break;
+                        }
+                    }
+                    if (!busy) {
+                        SRV_INF("%s", "kv stash exit: slots idle, states will be dumped on shutdown\n");
+                        return;
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                }
+                SRV_WRN("kv stash exit: slots still busy after %lld ms, terminating anyway (in-flight dump skipped)\n",
+                        (long long) timeout_ms);
+            }
+        }
+    }
+
     void destroy() {
         // persist the live slot states into the KV stash before the context
         // dies (covers both explicit unload and graceful child shutdown)
@@ -2116,6 +2161,51 @@ private:
                 (ggml_time_us() - t_start) / 1000.0);
 
         return true;
+    }
+
+    // fork A40 phase-1: same-preset alternation. when the incoming prompt
+    // forks out of a long resident tail early (shared prefix below 90% of a
+    // tail of >= 2048 text tokens), the slot rewind to n_past is about to
+    // partially evict the outgoing conversation's KV - stash its full state
+    // to disk first, so a later alternation back can restore it instead of
+    // re-prefilling ~95-100 min of prompt. same-preset only by construction:
+    // this runs on slot-assign, before any preset-swap path can touch the
+    // slot. dedup: skip when the identical state (digest + conv_hash +
+    // n_tokens) is already complete on disk - the sidecar is written last,
+    // so a sidecar implies a complete dump.
+    void kv_stash_fork_dump_check(server_slot & slot, const server_tokens & incoming) {
+        if (!kv_stash_enabled()) {
+            return;
+        }
+
+        // dump side is text-only (A39.1); skip early when either side carries media
+        if (slot.prompt.tokens.has_mtmd || incoming.has_mtmd) {
+            return;
+        }
+
+        const llama_tokens toks    = slot.prompt.tokens.get_text_tokens();
+        const llama_tokens in_toks = incoming.get_text_tokens();
+
+        kstash::fork_check fc = kstash::check_fork_dump(toks.data(), toks.size(), in_toks.data(), in_toks.size());
+        if (!fc.should_dump) {
+            return;
+        }
+
+        kstash::state_tag tag;
+        tag.digest    = kv_stash_digest;
+        tag.conv_hash = kstash::hex64(kstash::hash_tokens(toks.data(), toks.size()));
+        tag.n_tokens  = (int64_t) toks.size();
+
+        const std::string sidecar = kv_stash_dir + "/" + kstash::state_base_name(tag) + ".json";
+        std::error_code ec;
+        if (std::filesystem::exists(sidecar, ec) && !ec) {
+            SLT_DBG(slot, "kv stash: fork-dump skipped, state already on disk (%lld tokens)\n", (long long) tag.n_tokens);
+            return;
+        }
+
+        SLT_INF(slot, "kv stash: fork-dump (A40): incoming forks at %zu of %zu-tok resident tail, stashing before slot rewind\n",
+                fc.fork, fc.tail);
+        kv_stash_dump_slot(slot);
     }
 
     void kv_stash_try_restore(server_slot & slot, const server_tokens & incoming) {
@@ -4408,6 +4498,10 @@ private:
                             }
 
                             if (slot.task->params.cache_prompt && !slot.task->is_stateless()) {
+                                // fork A40 phase-1: stash the outgoing conversation before the
+                                // common-prefix mutation can rewind the slot past it
+                                kv_stash_fork_dump_check(slot, input_tokens);
+
                                 // reuse any previously computed tokens that are common with the new prompt
                                 n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
 
@@ -5514,6 +5608,10 @@ void server_context::start_loop() {
 
 void server_context::terminate() {
     impl->queue_tasks.terminate();
+}
+
+void server_context::cancel_inflight_for_exit(int64_t timeout_ms) {
+    impl->cancel_inflight_for_exit(timeout_ms);
 }
 
 llama_context * server_context::get_llama_context() const {
