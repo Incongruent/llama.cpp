@@ -3,10 +3,11 @@
 ## Verdict
 
 **KEEP and MERGE.** The converged salvage path is validated on controlled legs
-(exact temp-0 identity, −35.3 s prefill on the win geometry) and live soak
-traffic (11/17 salvage attempts bounded-tail wins, 0 behavior regressions).
-Merged to `prod` as `749a264f5` (fast-forward from the A59 phase-2 tip
-`12353cc26`); live-server swap is a separate quiet-window deploy decision.
+(exact temp-0 identity, −35.3 s prefill on the win geometry) and on a complete
+16.9 h production soak (61 stash consults: 31 verbatim restores, 17/28 salvage
+wins, net **215 min saved ≈ 21% of epoch wall**). Merged to `prod` as
+`749a264f5` (fast-forward from the A59 phase-2 tip `12353cc26`); the prod build
+tree just needs the next routine rebuild/restart to serve the merged code.
 
 ## Background
 
@@ -59,8 +60,7 @@ diverged token).
   (ring re-captured during the bounded re-prefill).
 - Unit tests `test-kv-stash`: 94 checks, 0 failures.
 
-## Live soak evidence (a42conv build, prod INI + the prod KV-stash dir
-(`kvstash_daily`), port 9712, window 16:25–22:47, ~6.4 h, 49 children)
+## Live soak evidence — interim window (a42conv build, prod INI + the prod KV-stash dir (`kvstash_daily`), port 9712, window 16:25–22:47, ~6.4 h, 49 children)
 
 Watch log: `soak_a42conv_watch.log` (filtered tail of the host-side server log
 `P40+3080-SOAK-A42CONV-20261112162551.log`).
@@ -86,16 +86,99 @@ Watch log: `soak_a42conv_watch.log` (filtered tail of the host-side server log
 - 1 in-child rewind-gap forcing-full event (task 977) — the residual ring-gap
   class A42 originally targeted; unchanged by this work.
 
-## Economics
+## Final full-epoch soak analysis (log cut 2026-11-13 09:21, ~16.9 h wall)
+
+Corpus: 77 children (61 children on the four 27B Q6K preset geometries + 16
+children on the 9B side model), ~270 requests on the 27B side, 61 stash
+consults at fresh-child re-entry — **every consult is cross-preset
+(prev child preset != current)**; zero same-preset re-entries ever spawned a
+fresh child, i.e. same-preset parent/child alternation never leaves the
+resident child (RAM cache + in-RAM checkpoints carry it; stash idle by design).
+The 9B side model served 16/16 children with NO stash consult and NO
+no-match line: its INI block runs with the kv-stash disabled — the same
+config asymmetry flagged in the A39 11-10 epoch, now re-confirmed at scale.
+
+### Scenario verdicts (user's five)
+
+| # | scenario | observed verdict |
+|---|---|---|
+| 1 | parent → child, different model/preset | every fresh-child re-entry consulted the disk stash (61/61 cross-preset): 31 full-match verbatim restores (all succeeded, exact tail-only prefill) + 28 salvage attempts + 1 gate rejection + 1 genuine no-match (new conversation/geometry) |
+| 2 | parent → child, same model | no swap occurs — resident child survives; reuse via RAM prompt cache + in-child checkpoints (1926 cache-reuse events, 31 in-RAM checkpoint rollbacks); zero stash events (by design, nothing left VRAM) |
+| 3 | child1 ‖ child2, different models | the 105k ↔ 198kq4 ping-pong (33 consults) is the parallel-subagent churn; the router serializes via kill/reload and the stash absorbs every re-entry; also 105k/118k/249kq4 crossings |
+| 4 | child1 ‖ child2, same model | both sessions share the resident child (single-tenant); zero stash events; RAM-cache only |
+| 5 | child returns focus to parent | = the return leg: 31 verbatim + 17/28 salvage wins absorbed it; the 9B side model blocks (which never consult) bracket those returns |
+
+### A/B/C answers
+
+- **A) checkpoints used successfully?** 17/28 salvage attempts achieved a
+  genuine checkpoint rollback (restored context checkpoint pos_min < F,
+  bounded tail, no forcing-full). In-child: 31 RAM checkpoint rollbacks on
+  rewind worked as before. 9/28 salvage attempts found NO covering checkpoint
+  (F below the smallest captured position) → forced full re-prefill.
+- **B) stash used successfully?** 31/31 verbatim restores succeeded; 17/28
+  salvage attempts succeeded; 1 rejected by the 4096 gate (correct); 1
+  no-match (correct); 2 salvage attempts aborted mid-restore by client
+  cancel (74 s restore spent, no leg completed).
+- **C) full prefill after using cache/stash?** After verbatim stash restore:
+  **0/31** (never). After salvage restore: **9/28** (the uncovered-divergence
+  cluster, net −67.2 s). After RAM cache: 3 forcing-full events from in-child
+  ring-gap rewinds (the residual class A42 originally targeted; the A59 epoch
+  had 0, small-sample noise).
+- **D) with/without-stash economics** (61 consult re-entries; per-request
+  marginal prefill rate from each leg's own prompt-eval line):
+
+  | class | n | tokens avoided | restore postage | net saved |
+  |---|---|---|---|---|
+  | verbatim restore | 31 | 1,778,176 | 70.7 s | **+12,417 s** |
+  | salvage win (ckpt rollback) | 17 | 156,298 | 79.9 s | **+579.6 s** |
+  | salvage loss (uncovered F) | 9 | 0 | 67.2 s | **−67.2 s** |
+  | **total (consults)** | 57 | 1,934,474 | 217.8 s | **+12,929 s** |
+
+  Counterfactual: the same 61 re-entries without the stash would have prefilled
+  2,278,655 tokens ≈ **18,217 s**; actual (prefill 5,070 s + restore 217.8 s) =
+  5,288 s → **215 min (3.6 h) saved ≈ 21.2% of the 16.9 h epoch wall; 71%
+  reduction of re-entry prefill cost.** 4 consults aborted by client cancel are
+  excluded from the sums.
+
+### Salvage geometry (why 17 won and 9 lost)
+
+- Losses: F ∈ {4,410 … 6,062} — the client's transcript-rewrite clusters sit
+  BELOW the smallest captured checkpoint (first gate-ckpt ≈ 8-9.7k); full
+  re-prefill anyway (518,409 tok paid). Upper-bound potential if the first
+  capture moved to the shared system-prompt head end (turn-anchored capture,
+  A42 trigger (d)): ≈ 460,904 tok ≈ 33 min/epoch.
+- Wins: F ∈ {8,092 … 9,876} — the recurring divergence depths land just past
+  the gate-captured checkpoints at pos_min ≈ 8,091 / 9,564 / 9,664 / 9,743 /
+  9,843. The 9,664 position recurs across DIFFERENT conversations (states
+  73,985–92,537 tok all rolling back to it) — the shared system-prompt head
+  ends there, and the prompt-boundary gate captures it; that single checkpoint
+  covers 7 of 17 wins.
+- Win legs saved 8.1-9.8k tokens each (−35 to −45 s each at ~4.3 ms/tok,
+  minus a 3-8 s restore); loss legs cost the restore for nothing (−3 to
+  −8 s each).
+
+### Operational observations
+
+- 15 force-kills (children busy at swap, killed after the 10 s timeout) and
+  14 client cancels — A61's measured drag pattern confirmed again at scale.
+- Restore times: verbatim 0.5-8.8 s typical; salvage 2.8-8.8 s; outliers
+  71.2 s (n=6108, cold NVMe right after load) and 8.8 s.
+- Salvage win example: 167,297-tok state, incoming 20,688, F=8,118 → rollback
+  to ckpt@8,091, tail 12,596 tok vs 20,688 full; six wrong-branch checkpoints
+  (21k-167k) rejected and erased cleanly; stash integrity intact.
+
+## Economics (final epoch)
 
 - The dominant re-prefill cost on this rig is opencode's client-side
   re-serialization of the transcript between turns (recurring divergence
-  clusters at F ≈ 4.4k, 6.0k, 8.1–9.0k, ~15k). When the divergence depth F sits
-  below a captured checkpoint position, the convergence converts a full
-  re-prefill into (state load + short tail) — the C1 shape (−35.3 s on a 10k
-  prompt) scales with `(F − P)` tokens avoided.
-- When no checkpoint covers F, salvage is load-cost-only; the 4096 gate keeps
-  shallow divergences out.
+  clusters at F ≈ 4.4-6.1k uncovered, 8.1-9.9k covered). The convergence turns
+  covered re-entries into (state load + short tail) and the verbatim path
+  (unchanged) carries the bulk of the savings (1.78M of 1.93M tokens avoided).
+- When no checkpoint covers F, salvage is load-cost-only (−3 to −8 s per
+  event); the 4096 gate keeps shallow divergences out.
+- Net effect measured across the full epoch: 12,929 s ≈ 215 min saved, 21.2%
+  of wall — the largest single lever measured in the campaign so far.
+
 
 ## Residuals / follow-ups
 
@@ -107,11 +190,20 @@ Watch log: `soak_a42conv_watch.log` (filtered tail of the host-side server log
    the same trailer would let the gate refuse when `(P+1)·4.2 ms < load ms`.
 3. **Live-deploy pending:** prod currently serves the pre-convergence build
    (build-a59); swapping needs a hot-swap in a quiet window (the a42conv soak
-   was still running at merge time).
-4. **F ≈ 6k cluster uncovered by the 8192-grid:** trigger (d) (turn-anchored
-   capture at user-turn ends) remains the lever.
-5. Related rows queued for the same quiet-window restart: A60 (prune_dir
-   no-op fix, ~118 GB reclaim) and A61 (stop-timeout = 120 / dump-on-exit).
+   has now completed with the convergence build serving the whole epoch — the
+   deploy question reduces to making the prod build/launcher point at the
+   merged prod tree).
+4. **F ≈ 4.4-6.1k cluster uncovered by the 8192-grid:** final-epoch evidence
+   quantifies the prize at ≈ 460,904 tok ≈ 33 min/epoch; trigger (d)
+   (turn-anchored capture at the shared system-prompt head end) remains the
+   lever and now has a measured ceiling.
+5. **9B side-model stash asymmetry (NEW, measured):** 16/16 Qwen3.5-9B
+   children ran with the kv-stash disabled (no consult, no dump) — same
+   config gap as the A39 11-10 epoch side profile; enabling it would extend
+   verbatim/salvage savings to side-model alternation.
+6. Related rows queued for the same quiet-window restart: A60 (prune_dir
+   no-op fix, ~118 GB reclaim) and A61 (stop-timeout = 120 / dump-on-exit;
+   15 force-kills re-confirmed this epoch).
 
 ## Branch / commit state
 
