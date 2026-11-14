@@ -2548,6 +2548,15 @@ extern "C" {
             struct ggml_tensor * a,
             int32_t              n_kv_max);
 
+    // b_shift: implicit causal shift for single-sequence prefill.
+    // When b_shift >= 0 and no mask tensor is attached, the backend applies a
+    // causal mask computed from the (q_pos - k_pos) offset instead of a mask tensor.
+    // The query at batch index i attends to key j when j <= i + b_shift.
+    // b_shift < 0 (the default) disables the implicit mask.
+    GGML_API void ggml_flash_attn_ext_set_b_shift(
+            struct ggml_tensor * a,
+            float                b_shift);
+
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);

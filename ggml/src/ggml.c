@@ -5602,6 +5602,9 @@ static struct ggml_tensor * ggml_flash_attn_ext_impl(
     float params[] = { scale, max_bias, logit_softcap };
     ggml_set_op_params(result, params, sizeof(params));
 
+    // b_shift defaults to < 0 (disabled); set via ggml_flash_attn_ext_set_b_shift()
+    ggml_set_op_params_f32(result, 5, -1.0f);
+
     result->op     = GGML_OP_FLASH_ATTN_EXT;
     result->src[0] = q;
     result->src[1] = k;
@@ -5664,6 +5667,14 @@ void ggml_flash_attn_ext_set_n_kv_max(
     GGML_ASSERT(n_kv_max >= 0);
 
     ggml_set_op_params_i32(a, 4, n_kv_max);
+}
+
+void ggml_flash_attn_ext_set_b_shift(
+        struct ggml_tensor * a,
+        float                b_shift) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+
+    ggml_set_op_params_f32(a, 5, b_shift);
 }
 
 void ggml_flash_attn_ext_add_sinks(

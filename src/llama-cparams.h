@@ -56,6 +56,7 @@ struct llama_cparams {
     bool warmup;             // TODO: remove [TAG_LLAMA_GRAPH_NO_WARMUP]
     bool op_offload;
     bool kv_unified;
+    bool b_shift;          // use implicit causal shift instead of mask tensor for single-seq causal prefill [A44]
     bool pipeline_parallel;
     bool training;           // set by llama_opt_init()
 

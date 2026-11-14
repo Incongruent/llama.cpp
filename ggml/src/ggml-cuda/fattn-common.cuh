@@ -34,6 +34,7 @@ typedef void (* fattn_kernel_t)(
         const float m1,
         const uint32_t n_head_log2,
         const float logit_softcap,
+        const float b_shift,
         const int32_t ne00, const uint3   ne01, const int32_t ne02, const int32_t ne03,
                             const int32_t nb01, const int32_t nb02, const int32_t nb03,
         const int32_t ne10, const int32_t ne11, const int32_t ne12, const int32_t ne13,
@@ -1239,10 +1240,12 @@ void launch_fattn(
     float scale         = 1.0f;
     float max_bias      = 0.0f;
     float logit_softcap = 0.0f;
+    float b_shift       = -1.0f;
 
     memcpy(&scale,         (const float *) KQV->op_params + 0, sizeof(float));
     memcpy(&max_bias,      (const float *) KQV->op_params + 1, sizeof(float));
     memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
+    memcpy(&b_shift,       (const float *) KQV->op_params + 5, sizeof(float));
 
     if (logit_softcap != 0.0f) {
         scale /= logit_softcap;
@@ -1269,7 +1272,7 @@ void launch_fattn(
         KV_max.ptr,
         kv_rows ? (const int *) kv_rows->data : nullptr,
         !stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data, dst_tmp_meta.ptr,
-        scale, max_bias, m0, m1, n_head_log2, logit_softcap,
+        scale, max_bias, m0, m1, n_head_log2, logit_softcap, b_shift,
         Q->ne[0], ne01,     Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],
         K->ne[0], n_kv, K->ne[2], K->ne[3], nb11, nb12, nb13,
         nb21, nb22, nb23,

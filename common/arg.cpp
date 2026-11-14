@@ -1749,6 +1749,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                                    string_format("error: unknown value for --flash-attn: '%s'\n", value.c_str()));
                            }
                        }).set_env("LLAMA_ARG_FLASH_ATTN"));
+    add_opt(common_arg({ "-bs", "--b-shift" }, "[on|off|auto]",
+                        string_format("use implicit causal shift instead of mask tensor for single-seq causal prefill ('on', 'off', or 'auto', default: '%s')",
+                                      params.b_shift ? "on" : "off"),
+                        [](common_params & params, const std::string & value) {
+                            if (is_truthy(value)) {
+                                params.b_shift = true;
+                            } else if (is_falsey(value)) {
+                                params.b_shift = false;
+                            } else if (is_autoy(value)) {
+                                params.b_shift = true;
+                            } else {
+                                throw std::runtime_error(
+                                    string_format("error: unknown value for --b-shift: '%s'\n", value.c_str()));
+                            }
+                        }).set_env("LLAMA_ARG_B_SHIFT"));
     add_opt(common_arg(
         {"-p", "--prompt"}, "PROMPT",
         "prompt to start generation with; for system message, use -sys",

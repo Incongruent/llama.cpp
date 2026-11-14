@@ -3037,8 +3037,24 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             cur = ggml_flash_attn_ext_rows(ctx0, q, k, v, kq_mask, kv_rows, kq_scale, hparams.f_max_alibi_bias,
                                            hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
         } else {
-            cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
-                                      hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+            // A44: use implicit causal shift (b_shift) instead of mask tensor for single-seq causal prefill
+            const bool use_bshift = cparams.b_shift && cparams.causal_attn && !cparams.training
+                && ubatch.n_seqs_unq == 1
+                && il < (int)n_layer
+                && hparams.f_max_alibi_bias == 0.0f;
+
+            if (use_bshift) {
+                cur = ggml_flash_attn_ext(ctx0, q, k, v, nullptr, kq_scale, 0.0f,
+                                          hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+                ggml_flash_attn_ext_set_b_shift(cur, 0.0f);
+                if (il == 0) {
+                    LLAMA_LOG_INFO("%s: b_shift path taken (single-seq causal prefill, %d tokens)\n",
+                                   __func__, (int)n_tokens);
+                }
+            } else {
+                cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
+                                          hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+            }
         }
         res->add_fused_node({kv_rows ? LLM_FUSED_OP_FLASH_ATTN_KV_ROWS : LLM_FUSED_OP_FLASH_ATTN, cur, il});
 

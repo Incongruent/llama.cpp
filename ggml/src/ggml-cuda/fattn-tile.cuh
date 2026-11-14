@@ -565,6 +565,7 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
         const uint3 ne01,
         const float logit_softcap,
         const float slope,
+        const float b_shift,
         T_KQ      * const KQ,
         T_vec_dot * const KV_tmp,
         const int stride_K2,
@@ -636,8 +637,14 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
             }
 
             if (!oob_check || i_KQ < k_VKQ_sup) {
-                KQ_acc[(i_KQ_0/(np*warp_size))*cpw + jc0] += (ncols2 > 1 || mask) ?
-                    slope*__half2float(mask[j*stride_mask + k_VKQ_0 + i_KQ]) : 0.0f;
+                if (b_shift >= 0.0f && mask == nullptr) {
+                    // implicit causal mask: key_pos <= query_pos  <=>  key <= query + b_shift
+                    const int bshift_i = (int)b_shift;
+                    KQ_acc[(i_KQ_0/(np*warp_size))*cpw + jc0] += (k_VKQ_0 + i_KQ <= j + bshift_i) ? 0.0f : -INFINITY;
+                } else {
+                    KQ_acc[(i_KQ_0/(np*warp_size))*cpw + jc0] += (ncols2 > 1 || mask) ?
+                        slope*__half2float(mask[j*stride_mask + k_VKQ_0 + i_KQ]) : 0.0f;
+                }
 
                 KQ_max_new[jc0] = fmaxf(KQ_max_new[jc0], KQ_acc[(i_KQ_0/(np*warp_size))*cpw + jc0] + FATTN_KQ_MAX_OFFSET);
             }
@@ -806,6 +813,7 @@ static __global__ void flash_attn_tile(
         const float m1,
         const uint32_t n_head_log2,
         const float logit_softcap,
+        const float b_shift,
         const int32_t ne00, const uint3   ne01, const int32_t ne02, const int32_t ne03,
                             const int32_t nb01, const int32_t nb02, const int32_t nb03,
         const int32_t ne10, const int32_t ne11, const int32_t ne12, const int32_t ne13,
@@ -828,7 +836,7 @@ static __global__ void flash_attn_tile(
 
     if ((use_logit_softcap && !(DV == 128 || DV == 256 || DV == 512))) {
         GGML_UNUSED_VARS(Q, K, V, mask, sinks, KV_max, dst, dst_meta, scale,
-            max_bias, m0, m1, n_head_log2, logit_softcap,
+            max_bias, m0, m1, n_head_log2, logit_softcap, b_shift,
             ne00, ne01, ne02, ne03,
                   nb01, nb02, nb03,
             ne10, ne11, ne12, ne13,
@@ -960,14 +968,14 @@ static __global__ void flash_attn_tile(
         while (k_VKQ_0 <= k_VKQ_max - nbatch_fa) {
             constexpr bool oob_check = false;
             flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check>
-                (Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
+                (Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, b_shift, KQ, KV_tmp,
                 stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0);
             k_VKQ_0 += gridDim.y*nbatch_fa;
         }
         if (k_VKQ_0 < k_VKQ_max) {
             constexpr bool oob_check = true;
             flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check>
-                (Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
+                (Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, b_shift, KQ, KV_tmp,
                 stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0);
         }
     } else {
@@ -975,7 +983,7 @@ static __global__ void flash_attn_tile(
         for (int k_VKQ_0 = blockIdx.y*nbatch_fa; k_VKQ_0 < k_VKQ_max; k_VKQ_0 += gridDim.y*nbatch_fa) {
             constexpr bool oob_check = false;
             flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check>
-                (Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
+                (Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, b_shift, KQ, KV_tmp,
                 stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0);
         }
     }
@@ -1135,7 +1143,7 @@ static __global__ void flash_attn_tile(
     }
 #else
     GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, KV_rows_ptr, dst_ptr, dst_meta_ptr, scale,
-        max_bias, m0, m1, n_head_log2, logit_softcap,
+        max_bias, m0, m1, n_head_log2, logit_softcap, b_shift,
         ne00, ne01, ne02, ne03,
               nb01, nb02, nb03,
         ne10, ne11, ne12, ne13,
