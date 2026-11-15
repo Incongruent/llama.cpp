@@ -392,8 +392,10 @@ void prune_dir(const std::string & dir, int64_t limit_bytes, const std::string &
             continue;
         }
 
-        std::string name = it->path().filename().string();
-        if (name.size() < 7 || name.compare(name.size() - 7, 7, ".kvstate") != 0) {
+        // fork A60: ".kvstate" is 8 chars - the previous last-7 compare
+        // ("kvstate" vs ".kvstate") was always nonzero, making prune_dir a
+        // silent no-op (every file skipped, nothing ever deleted)
+        if (it->path().extension().string() != ".kvstate") {
             continue;
         }
 

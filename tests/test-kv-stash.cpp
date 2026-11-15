@@ -16,9 +16,12 @@
 
 #include "server-kv-stash.h"
 
+#include <chrono>
 #include <cstdio>
+#include <fstream>
 #include <filesystem>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -275,6 +278,88 @@ static void test_note_nullptr(const fs::path & dir) {
     CHECK(!kstash::find_best_state(dir.string(), DIGEST, hasher, 4, cand, /*note=*/nullptr));
 }
 
+// fork A60: prune_dir regression tests. the name filter previously compared
+// the last 7 chars ("kvstate") against the 8-char ".kvstate" suffix and never
+// matched, so prune was a silent no-op (nothing ever deleted, live dir grew
+// unbounded). these tests pin: byte-cap eviction oldest-first, companion
+// (.json/.tokens) removal with their state, keep_path protection, and
+// companion-only files (orphans) being neither counted nor removed.
+
+static bool file_exists(const fs::path & p) {
+    std::error_code ec;
+    return fs::exists(p, ec) && !ec;
+}
+
+static void write_raw(const fs::path & path, size_t nbytes) {
+    std::ofstream ofs(path, std::ios::binary | std::ios::trunc);
+    CHECK((bool) ofs);
+    const std::string blob(nbytes, 'x');
+    ofs.write(blob.data(), (std::streamsize) blob.size());
+    CHECK((bool) ofs);
+    // ensure distinct mtimes: prune evicts oldest-first by mtime
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+}
+
+// one fake state = .kvstate blob of `nbytes` + companions at the production
+// paths (<state>.kvstate.json / <state>.kvstate.tokens)
+static void make_raw_state(const fs::path & dir, const char * stem, size_t nbytes) {
+    write_raw((dir / (std::string(stem) + ".kvstate")).string(), nbytes);
+    write_raw((dir / (std::string(stem) + ".kvstate.json")).string(), 8);
+    write_raw((dir / (std::string(stem) + ".kvstate.tokens")).string(), 8);
+}
+
+static void test_prune_oldest_to_cap(const fs::path & dir) {
+    make_raw_state(dir, "kvst_aaaaaa_h1_10", 10);
+    make_raw_state(dir, "kvst_aaaaaa_h2_20", 20);
+    make_raw_state(dir, "kvst_aaaaaa_h3_30", 30);
+
+    // under the cap: nothing is deleted
+    kstash::prune_dir(dir.string(), 100, "");
+    CHECK(file_exists(dir / "kvst_aaaaaa_h1_10.kvstate"));
+    CHECK(file_exists(dir / "kvst_aaaaaa_h3_30.kvstate"));
+
+    // total 60, cap 31: the two oldest states go (with companions), newest stays
+    kstash::prune_dir(dir.string(), 31, "");
+    CHECK(!file_exists(dir / "kvst_aaaaaa_h1_10.kvstate"));
+    CHECK(!file_exists(dir / "kvst_aaaaaa_h1_10.kvstate.json"));
+    CHECK(!file_exists(dir / "kvst_aaaaaa_h1_10.kvstate.tokens"));
+    CHECK(!file_exists(dir / "kvst_aaaaaa_h2_20.kvstate"));
+    CHECK(!file_exists(dir / "kvst_aaaaaa_h2_20.kvstate.json"));
+    CHECK(!file_exists(dir / "kvst_aaaaaa_h2_20.kvstate.tokens"));
+    CHECK(file_exists(dir / "kvst_aaaaaa_h3_30.kvstate"));
+    CHECK(file_exists(dir / "kvst_aaaaaa_h3_30.kvstate.json"));
+    CHECK(file_exists(dir / "kvst_aaaaaa_h3_30.kvstate.tokens"));
+}
+
+static void test_prune_keep_path(const fs::path & dir) {
+    make_raw_state(dir, "kvst_bbbbbb_h4_40", 40);
+    make_raw_state(dir, "kvst_bbbbbb_h5_50", 50);
+    // total 90, cap 60, keep the OLDEST (40): the newer 50 must go instead
+    kstash::prune_dir(dir.string(), 60, (dir / "kvst_bbbbbb_h4_40.kvstate").string());
+    CHECK(file_exists(dir / "kvst_bbbbbb_h4_40.kvstate"));
+    CHECK(file_exists(dir / "kvst_bbbbbb_h4_40.kvstate.json"));
+    CHECK(file_exists(dir / "kvst_bbbbbb_h4_40.kvstate.tokens"));
+    CHECK(!file_exists(dir / "kvst_bbbbbb_h5_50.kvstate"));
+    CHECK(!file_exists(dir / "kvst_bbbbbb_h5_50.kvstate.json"));
+    CHECK(!file_exists(dir / "kvst_bbbbbb_h5_50.kvstate.tokens"));
+}
+
+static void test_prune_companion_files(const fs::path & dir) {
+    // companion-named files WITHOUT their .kvstate (orphans) are neither
+    // counted toward the cap nor removed by prune_dir
+    write_raw(dir / "kvst_cccccc_h6_5.kvstate.json", 8);
+    write_raw(dir / "kvst_cccccc_h6_5.kvstate.tokens", 8);
+    make_raw_state(dir, "kvst_cccccc_h7_5", 5);
+
+    // cap 1: the 5-byte state cannot fit, it goes; orphans survive
+    kstash::prune_dir(dir.string(), 1, "");
+    CHECK(!file_exists(dir / "kvst_cccccc_h7_5.kvstate"));
+    CHECK(!file_exists(dir / "kvst_cccccc_h7_5.kvstate.json"));
+    CHECK(!file_exists(dir / "kvst_cccccc_h7_5.kvstate.tokens"));
+    CHECK(file_exists(dir / "kvst_cccccc_h6_5.kvstate.json"));
+    CHECK(file_exists(dir / "kvst_cccccc_h6_5.kvstate.tokens"));
+}
+
 int main() {
     const fs::path root = fs::temp_directory_path() / "kvst_test_a59";
     std::error_code ec;
@@ -303,6 +388,9 @@ int main() {
     run("digest_filter",        test_digest_filter);
     run("empty_missing",        test_empty_and_missing_dir);
     run("note_null",            test_note_nullptr);
+    run("prune_oldest",         test_prune_oldest_to_cap);
+    run("prune_keep",           test_prune_keep_path);
+    run("prune_orphans",        test_prune_companion_files);
 
     fs::remove_all(root, ec);
 
