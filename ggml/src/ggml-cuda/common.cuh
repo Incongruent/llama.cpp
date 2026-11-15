@@ -1457,6 +1457,14 @@ struct ggml_backend_cuda_context {
     std::string name;
     cudaEvent_t copy_event = nullptr;
 
+    // A47: double-buffered pinned host staging for cross-device (non-P2P) copies.
+    // Replaces cudaMemcpyPeerAsync's internal single-buffered staging so that
+    // D2H of copy N+1 can overlap with H2D of copy N.
+    void   * staging_buf[2]    = { nullptr, nullptr };
+    size_t   staging_buf_size  = 0;
+    int      staging_buf_idx   = 0;   // next buffer to use (toggles 0/1)
+    cudaEvent_t staging_event[2] = { nullptr, nullptr };
+
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {};
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {};
     void * cublas_workspaces[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {};

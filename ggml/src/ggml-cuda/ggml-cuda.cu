@@ -795,6 +795,15 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
     }
+    // A47: free double-buffered pinned staging
+    for (int i = 0; i < 2; i++) {
+        if (staging_buf[i] != nullptr) {
+            CUDA_CHECK(cudaFreeHost(staging_buf[i]));
+        }
+        if (staging_event[i] != nullptr) {
+            CUDA_CHECK(cudaEventDestroy(staging_event[i]));
+        }
+    }
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
             if (streams[i][j] != nullptr) {
@@ -2961,26 +2970,68 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
         // in which case a same-device copy (not a peer copy) is required
         const int src_physical = ggml_cuda_get_physical_device(cuda_ctx_src->device);
         const int dst_physical = ggml_cuda_get_physical_device(cuda_ctx_dst->device);
+        const size_t n_bytes = ggml_nbytes(dst);
+
         if (src_physical == dst_physical) {
-            CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, cuda_ctx_src->stream()));
+            // same physical device: simple D2D copy on src stream
+            CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, n_bytes, cudaMemcpyDeviceToDevice, cuda_ctx_src->stream()));
+
+            // record event on src stream after the copy
+            if (!cuda_ctx_src->copy_event) {
+                ggml_cuda_set_device(cuda_ctx_src->device);
+                CUDA_CHECK(cudaEventCreateWithFlags(&cuda_ctx_src->copy_event, cudaEventDisableTiming));
+            }
+            CUDA_CHECK(cudaEventRecord(cuda_ctx_src->copy_event, cuda_ctx_src->stream()));
+            // wait on dst stream for the copy to complete
+            CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx_dst->stream(), cuda_ctx_src->copy_event, 0));
         } else {
+            // A47: different physical devices (no P2P on this rig).
+            // Use double-buffered pinned host staging so that D2H of copy N+1
+            // can overlap with H2D of copy N (single-buffered cudaMemcpyPeerAsync
+            // cannot overlap because it shares one internal staging buffer).
 #ifdef GGML_CUDA_NO_PEER_COPY
             return false;
 #else
-            CUDA_CHECK(cudaMemcpyPeerAsync(dst->data, dst_physical, src->data, src_physical, ggml_nbytes(dst), cuda_ctx_src->stream()));
+            // Lazily allocate the pinned staging buffers (fixed 32 MiB — well above
+            // any realistic handoff copy).  If a copy exceeds the buffer we fall
+            // back to cudaMemcpyPeerAsync rather than risking a cudaFreeHost on a
+            // buffer still referenced by an in-flight DMA.
+            if (cuda_ctx_src->staging_buf_size < n_bytes) {
+                if (cuda_ctx_src->staging_buf_size > 0) {
+                    // buffer too small for this copy — fall back to peer copy
+                    return false;
+                }
+                const size_t kMinStaging = 32 * 1024 * 1024; // 32 MiB
+                const size_t alloc_size  = n_bytes > kMinStaging ? n_bytes : kMinStaging;
+                CUDA_CHECK(cudaHostAlloc(&cuda_ctx_src->staging_buf[0], alloc_size, cudaHostAllocDefault));
+                CUDA_CHECK(cudaHostAlloc(&cuda_ctx_src->staging_buf[1], alloc_size, cudaHostAllocDefault));
+                cuda_ctx_src->staging_buf_size = alloc_size;
+                cuda_ctx_src->staging_buf_idx  = 0;
+            }
+            // Lazily create the staging events (one per buffer).
+            if (cuda_ctx_src->staging_event[0] == nullptr) {
+                ggml_cuda_set_device(cuda_ctx_src->device);
+                CUDA_CHECK(cudaEventCreateWithFlags(&cuda_ctx_src->staging_event[0], cudaEventDisableTiming));
+                CUDA_CHECK(cudaEventCreateWithFlags(&cuda_ctx_src->staging_event[1], cudaEventDisableTiming));
+            }
+
+            // Alternate between the two staging buffers so that a second in-flight
+            // copy (same direction) does not overwrite a buffer still being read
+            // by the previous H2D.
+            const int buf_idx = cuda_ctx_src->staging_buf_idx;
+            cuda_ctx_src->staging_buf_idx = 1 - buf_idx;
+            void * staging = cuda_ctx_src->staging_buf[buf_idx];
+
+            // D2H on src stream — ordered after the src device's compute.
+            CUDA_CHECK(cudaMemcpyAsync(staging, src->data, n_bytes, cudaMemcpyDeviceToHost, cuda_ctx_src->stream()));
+            // Mark D2H completion on the src stream.
+            CUDA_CHECK(cudaEventRecord(cuda_ctx_src->staging_event[buf_idx], cuda_ctx_src->stream()));
+            // dst stream must not start H2D until the D2H is done.
+            CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx_dst->stream(), cuda_ctx_src->staging_event[buf_idx], 0));
+            // H2D on dst stream — ordered before the dst device's compute.
+            CUDA_CHECK(cudaMemcpyAsync(dst->data, staging, n_bytes, cudaMemcpyHostToDevice, cuda_ctx_dst->stream()));
 #endif // GGML_CUDA_NO_PEER_COPY
         }
-
-        // record event on src stream after the copy
-        if (!cuda_ctx_src->copy_event) {
-            ggml_cuda_set_device(cuda_ctx_src->device);
-            CUDA_CHECK(cudaEventCreateWithFlags(&cuda_ctx_src->copy_event, cudaEventDisableTiming));
-        }
-
-        CUDA_CHECK(cudaEventRecord(cuda_ctx_src->copy_event, cuda_ctx_src->stream()));
-
-        // wait on dst stream for the copy to complete
-        CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx_dst->stream(), cuda_ctx_src->copy_event, 0));
     } else {
         // src and dst are on the same backend
         CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, cuda_ctx_src->stream()));

@@ -1246,6 +1246,10 @@ struct ggml_backend_sched {
     int prev_graph_size;
 
     int debug_realloc;
+
+    // A47: cross-device event sync for PP-off mode (LLAMA_SCHED_EVENTS=0 to disable)
+    bool sched_events_enabled;
+    int  sync_count; // number of full ggml_backend_synchronize calls this compute cycle
 };
 
 #define hash_id(tensor) ggml_hash_find_or_insert(&sched->hash_set, tensor)
@@ -2091,6 +2095,7 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
             ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
         } else {
+            sched->sync_count++;
             ggml_backend_synchronize(split_backend);
         }
         ggml_backend_tensor_copy(input, input_cpy);
@@ -2101,6 +2106,7 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
     if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
         ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
     } else {
+        sched->sync_count++;
         ggml_backend_synchronize(split_backend);
     }
 
@@ -2112,10 +2118,12 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
     if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
+        sched->sync_count++;
         ggml_backend_synchronize(input_backend);
         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
             ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
         } else {
+            sched->sync_count++;
             ggml_backend_synchronize(split_backend);
         }
         ggml_backend_tensor_copy(input, input_cpy);
@@ -2128,6 +2136,17 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
     int prev_backend_id = -1;
 
+    // A47: in PP-off mode, record events at the start so that the first split's
+    // input-copy wait (ggml_backend_event_wait) has a valid event to wait on.
+    // In PP mode the events are already recorded from the previous iteration.
+    if (sched->sched_events_enabled && sched->n_copies == 1) {
+        for (int b = 0; b < sched->n_backends; b++) {
+            if (sched->events[b][sched->cur_copy] != NULL) {
+                ggml_backend_event_record(sched->events[b][sched->cur_copy], sched->backends[b]);
+            }
+        }
+    }
+
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
@@ -2137,8 +2156,21 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         // this split, the allocator may have reused buffer regions across splits
         if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
             if (sched->events[prev_backend_id][sched->cur_copy] != NULL) {
-                ggml_backend_event_synchronize(sched->events[prev_backend_id][sched->cur_copy]);
+                if (sched->n_copies > 1) {
+                    // PP mode: CPU must know when the previous split is done
+                    ggml_backend_event_synchronize(sched->events[prev_backend_id][sched->cur_copy]);
+                } else if (split_backend->iface.event_wait != NULL) {
+                    // A47 PP-off mode: stream-side wait, no CPU block.
+                    // Guard: backends without stream-side event_wait (e.g. the CPU
+                    // backend, whose iface event slots are NULL) would GGML_ABORT in
+                    // ggml_backend_event_wait; fall back to a counted full sync.
+                    ggml_backend_event_wait(split_backend, sched->events[prev_backend_id][sched->cur_copy]);
+                } else {
+                    sched->sync_count++;
+                    ggml_backend_synchronize(sched->backends[prev_backend_id]);
+                }
             } else {
+                sched->sync_count++;
                 ggml_backend_synchronize(sched->backends[prev_backend_id]);
             }
         }
@@ -2185,6 +2217,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 }
 
                 // TODO: pass backend to the callback, then the user can decide if they want to synchronize
+                sched->sync_count++;
                 ggml_backend_synchronize(split_backend);
 
                 if (need && !sched->callback_eval(t, false, sched->callback_eval_user_data)) {
@@ -2202,6 +2235,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
         prev_backend_id = split_backend_id;
     }
+
+    // A47: greppable sync-count log (one line per compute cycle)
+    if (sched->sync_count > 0 || (sched->sched_events_enabled && sched->debug >= 1)) {
+        GGML_LOG_INFO("%s: A47 sync_count=%d  n_splits=%d  n_copies=%d  events=%s\n",
+            __func__, sched->sync_count, sched->n_splits, sched->n_copies,
+            sched->sched_events_enabled ? "on" : "off");
+    }
+    sched->sync_count = 0;
 
     return GGML_STATUS_SUCCESS;
 }
@@ -2258,12 +2299,17 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->graph_inputs_capacity = GGML_SCHED_MAX_SPLIT_INPUTS;
     sched->graph_inputs = (struct ggml_tensor **) calloc(sched->graph_inputs_capacity, sizeof(struct ggml_tensor *));
 
+    // A47: event-based sync for PP-off mode (LLAMA_SCHED_EVENTS=0 to disable)
+    const char * GGML_SCHED_EVENTS = getenv("LLAMA_SCHED_EVENTS");
+    sched->sched_events_enabled = GGML_SCHED_EVENTS ? atoi(GGML_SCHED_EVENTS) != 0 : true;
+    sched->sync_count = 0;
+
     for (int b = 0; b < n_backends; b++) {
         sched->backends[b] = backends[b];
         sched->bufts[b] = bufts ? bufts[b] : ggml_backend_get_default_buffer_type(backends[b]);
         GGML_ASSERT(ggml_backend_supports_buft(backends[b], sched->bufts[b]));
 
-        if (sched->n_copies > 1) {
+        if (sched->sched_events_enabled || sched->n_copies > 1) {
             for (int c = 0; c < sched->n_copies; c++) {
                 sched->events[b][c] = ggml_backend_event_new(backends[b]->device);
             }
