@@ -683,6 +683,9 @@ static int server_run_instance(common_params & params, server_role & role, commo
 
     shutdown_handler = [&](int) {
         mcp_mgr.shutdown();
+        // fork A61: unwind in-flight tasks before terminating, so slots go
+        // IDLE and the exit path can still dump their states to the KV stash
+        ctx_server.cancel_inflight_for_exit(8000);
         // this will unblock start_loop()
         ctx_server.terminate();
     };

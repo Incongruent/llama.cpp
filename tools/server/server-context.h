@@ -77,6 +77,11 @@ struct server_context {
     // terminate main loop (will unblock start_loop)
     void terminate();
 
+    // fork A61: post cancels for in-flight tasks and wait (bounded) for slots
+    // to go idle, so the exit path can still dump slot states to the KV stash;
+    // call right before terminate() (may be called from any thread)
+    void cancel_inflight_for_exit(int64_t timeout_ms);
+
     // get the underlaying llama_context, can return nullptr if sleeping
     // not thread-safe, should only be used from the main thread
     llama_context * get_llama_context() const;

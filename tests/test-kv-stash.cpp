@@ -360,7 +360,86 @@ static void test_prune_companion_files(const fs::path & dir) {
     CHECK(file_exists(dir / "kvst_cccccc_h6_5.kvstate.tokens"));
 }
 
-int main() {
+// fork A40 phase-1: same-preset alternation fork-dump trigger
+static void test_check_fork_dump() {
+    std::vector<llama_token> tail(4096);
+    for (size_t i = 0; i < tail.size(); ++i) {
+        tail[i] = (llama_token) (i % 1000);
+    }
+
+    // token-0 divergence (different conversation): dump
+    {
+        std::vector<llama_token> in(100, (llama_token) 5000);
+        kstash::fork_check fc = kstash::check_fork_dump(tail.data(), tail.size(), in.data(), in.size());
+        CHECK(fc.tail == 4096);
+        CHECK(fc.fork == 0);
+        CHECK(fc.should_dump);
+    }
+
+    // interior early fork: dump
+    {
+        std::vector<llama_token> in(tail.begin(), tail.begin() + 500);
+        in.push_back((llama_token) 5000);
+        kstash::fork_check fc = kstash::check_fork_dump(tail.data(), tail.size(), in.data(), in.size());
+        CHECK(fc.fork == 500);
+        CHECK(fc.should_dump); // 500 < 0.9 * 4096
+    }
+
+    // exact tail growth (incoming == tail): the same conversation growing, no dump
+    {
+        kstash::fork_check fc = kstash::check_fork_dump(tail.data(), tail.size(), tail.data(), tail.size());
+        CHECK(fc.fork == 4096);
+        CHECK(fc.fork == fc.tail);
+        CHECK(!fc.should_dump);
+    }
+
+    // deep continuation (fork >= 90% of tail): no dump; exact 90% is not "below"
+    // (tail 4090 so 0.9 * tail is an exact integer boundary: 3681)
+    {
+        std::vector<llama_token> in(tail.begin(), tail.begin() + 3681);
+        in.push_back((llama_token) 5000);
+        kstash::fork_check fc = kstash::check_fork_dump(tail.data(), 4090, in.data(), in.size());
+        CHECK(fc.fork == 3681);
+        CHECK(fc.fork * 10 == fc.tail * 9); // exactly 90% of tail
+        CHECK(!fc.should_dump);
+    }
+    {
+        std::vector<llama_token> in(tail.begin(), tail.begin() + 3680); // one below the gate
+        in.push_back((llama_token) 5000);
+        kstash::fork_check fc = kstash::check_fork_dump(tail.data(), 4090, in.data(), in.size());
+        CHECK(fc.fork == 3680);
+        CHECK(fc.should_dump);
+    }
+
+    // incoming shorter than tail, still a deep continuation: no dump
+    {
+        std::vector<llama_token> in(tail.begin(), tail.begin() + 4000);
+        kstash::fork_check fc = kstash::check_fork_dump(tail.data(), tail.size(), in.data(), in.size());
+        CHECK(fc.fork == 4000);
+        CHECK(!fc.should_dump);
+    }
+
+    // short resident tail (below the 2048-token gate): never dump
+    {
+        std::vector<llama_token> in(8, (llama_token) 5000);
+        kstash::fork_check fc = kstash::check_fork_dump(tail.data(), 100, in.data(), in.size());
+        CHECK(fc.tail == 100);
+        CHECK(fc.fork == 0);
+        CHECK(!fc.should_dump);
+    }
+
+    // degenerate inputs: null/empty sides never dump
+    {
+        kstash::fork_check fc = kstash::check_fork_dump(nullptr, 0, nullptr, 0);
+        CHECK(!fc.should_dump);
+        fc = kstash::check_fork_dump(tail.data(), 0, tail.data(), tail.size());
+        CHECK(!fc.should_dump);
+        fc = kstash::check_fork_dump(tail.data(), tail.size(), tail.data(), 0);
+        CHECK(!fc.should_dump);
+    }
+}
+
+ int main() {
     const fs::path root = fs::temp_directory_path() / "kvst_test_a59";
     std::error_code ec;
     fs::remove_all(root, ec);
@@ -374,6 +453,7 @@ int main() {
 
     test_first_mismatch_index();
     test_stream_has_media();
+    test_check_fork_dump();
     run("accept_superset",      test_accept_superset_prefix);
     run("accept_shorter",       test_accept_shorter_fit);
     run("salvage_sup_int",      test_salvage_superset_interior);

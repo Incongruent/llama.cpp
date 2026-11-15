@@ -179,6 +179,27 @@ size_t first_mismatch_index(const llama_token * a, const llama_token * b, size_t
     return n;
 }
 
+fork_check check_fork_dump(const llama_token * tail_data, size_t n_tail,
+                           const llama_token * incoming_data, size_t n_incoming,
+                           size_t min_tail, double fork_frac) {
+    fork_check out;
+    out.tail = n_tail;
+
+    if (tail_data == nullptr || incoming_data == nullptr || n_tail == 0 || n_incoming == 0) {
+        return out;
+    }
+
+    const size_t n = std::min(n_tail, n_incoming);
+    out.fork = first_mismatch_index(tail_data, incoming_data, n);
+
+    if (n_tail < min_tail) {
+        return out;
+    }
+
+    out.should_dump = (double) out.fork < fork_frac * (double) n_tail;
+    return out;
+}
+
 bool find_best_state(const std::string & dir, const std::string & digest,
                      const prefix_hasher & hasher, size_t n_incoming, candidate & out,
                      std::string * note) {
