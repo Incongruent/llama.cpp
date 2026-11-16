@@ -875,6 +875,17 @@ struct llm_graph_params {
             return false;
         }
 
+        // A44: the b_shift offset (== ubatch.pos[0]) is baked into the flash-attn op as a constant,
+        //   so a stored graph that may have used the b_shift path can only be reused if the first
+        //   query position is unchanged (the baked shift would otherwise be stale)
+        if (cparams.b_shift && cparams.causal_attn && !cparams.training
+            && ubatch.n_seqs_unq == 1 && ubatch.n_pos == 1
+            && hparams.f_max_alibi_bias == 0.0f
+            && ubatch.n_tokens > 1
+            && ubatch.pos[0] != other.ubatch.pos[0]) {
+            return false;
+        }
+
         if (n_outputs != other.n_outputs) {
             return false;
         }
@@ -1087,6 +1098,9 @@ struct llm_graph_context {
 
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;
+
+    // A44: cached b_shift gate result, computed once per ubatch in the constructor
+    bool bshift_ok = false;
 
     llm_graph_context(const llm_graph_params & params);
     virtual ~llm_graph_context() = default;

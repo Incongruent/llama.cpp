@@ -3035,6 +3035,24 @@ uint32_t llama_kv_cache_context::get_n_kv_rows() const {
     return n_kv_rows;
 }
 
+bool llama_kv_cache_context::is_prefix_dense_unshifted(llama_seq_id seq_id) const {
+    if (kv->get_has_shift()) {
+        return false;
+    }
+
+    const auto & cells = kv->get_cells(seq_id);
+
+    const uint32_t n = cells.used_max_p1();
+
+    for (uint32_t c = 0; c < n; ++c) {
+        if (cells.is_empty(c) || cells.pos_get(c) != (llama_pos) c) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 ggml_type llama_kv_cache_context::type_k() const {
     return kv->type_k();
 }

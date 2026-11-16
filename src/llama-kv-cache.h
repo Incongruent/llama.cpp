@@ -412,6 +412,10 @@ public:
     uint32_t get_n_kv() const;
     uint32_t get_n_kv_rows() const;
 
+    // A44: true if seq_id's cells form a dense, unshifted prefix (cell c holds position c, no holes or shifts)
+    //   used to decide whether the implicit causal shift (b_shift) may replace the mask tensor
+    bool is_prefix_dense_unshifted(llama_seq_id seq_id) const override;
+
     ggml_type type_k() const;
     ggml_type type_v() const;
 

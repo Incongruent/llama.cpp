@@ -1611,6 +1611,30 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     ctx0             (res->get_ctx()),
     gf               (res->get_gf()) {
         res->set_params(params);
+
+        // A44: compute the b_shift gate once per ubatch; build_attn_mha reads the cached result.
+        //   the gate is safe to evaluate here because the KV cache state is already applied for
+        //   the current ubatch (see llama_kv_cache_context::apply)
+        bshift_ok = cparams.b_shift && cparams.causal_attn && !cparams.training
+            && ubatch.n_seqs_unq == 1 && ubatch.n_pos == 1
+            && hparams.f_max_alibi_bias == 0.0f
+            && ubatch.n_tokens > 1;
+        if (bshift_ok) {
+            // G2: query positions must be a consecutive run (pos[i] == pos[0] + i)
+            const llama_pos p0 = ubatch.pos[0];
+            for (uint32_t i = 1; i < ubatch.n_tokens; ++i) {
+                if (ubatch.pos[i] != p0 + i) {
+                    bshift_ok = false;
+                    break;
+                }
+            }
+        }
+        if (bshift_ok) {
+            // G1: the KV prefix must be dense and unshifted so the implicit causal shift
+            //   matches the mask (key cell c holds position c). virtual dispatch keeps this
+            //   safe for non cell-based memory contexts (swa/dsa/msa/hybrid wrappers)
+            bshift_ok = mctx != nullptr && mctx->is_prefix_dense_unshifted(ubatch.seq_id_unq[0]);
+        }
     }
 
 void llm_graph_context::cb(ggml_tensor * cur, const char * name, int il) const {
@@ -3037,19 +3061,19 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             cur = ggml_flash_attn_ext_rows(ctx0, q, k, v, kq_mask, kv_rows, kq_scale, hparams.f_max_alibi_bias,
                                            hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
         } else {
-            // A44: use implicit causal shift (b_shift) instead of mask tensor for single-seq causal prefill
-            const bool use_bshift = cparams.b_shift && cparams.causal_attn && !cparams.training
-                && ubatch.n_seqs_unq == 1
-                && il < (int)n_layer
-                && hparams.f_max_alibi_bias == 0.0f;
+            // A44: use implicit causal shift (b_shift) instead of mask tensor for single-seq causal prefill.
+            //   bshift_ok is the cached gate (consecutive positions + dense/unshifted single-seq KV prefix +
+            //   1D positions + prefill); the offset must equal the first query position so that the kernel's
+            //   test (key_col <= query_idx + b_shift) reproduces the mask (pos_get(key_col) <= query_abs_pos)
+            const bool use_bshift = bshift_ok && il < (int)n_layer;
 
             if (use_bshift) {
                 cur = ggml_flash_attn_ext(ctx0, q, k, v, nullptr, kq_scale, 0.0f,
                                           hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
-                ggml_flash_attn_ext_set_b_shift(cur, 0.0f);
+                ggml_flash_attn_ext_set_b_shift(cur, (float) ubatch.pos[0]);
                 if (il == 0) {
-                    LLAMA_LOG_INFO("%s: b_shift path taken (single-seq causal prefill, %d tokens)\n",
-                                   __func__, (int)n_tokens);
+                    LLAMA_LOG_INFO("%s: b_shift path taken (single-seq causal prefill, %d tokens, b_shift = %d)\n",
+                                   __func__, (int)n_tokens, (int)ubatch.pos[0]);
                 }
             } else {
                 cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,

@@ -95,6 +95,11 @@ struct llama_memory_context_i {
 
     // get the status of the memory context - used for error handling and checking if any updates would be applied
     virtual llama_memory_status get_status() const = 0;
+
+    // A44: true if seq_id's KV prefix is dense and unshifted (cell c holds position c, no holes or shifts)
+    //   used to decide whether the implicit causal shift (b_shift) may replace the mask tensor
+    //   returns false for memory contexts that do not expose a cell-based KV cache (swa/dsa/msa/hybrid wrappers)
+    virtual bool is_prefix_dense_unshifted(llama_seq_id seq_id) const { return false; }
 };
 
 using llama_memory_context_ptr = std::unique_ptr<llama_memory_context_i>;
