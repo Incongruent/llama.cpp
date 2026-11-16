@@ -2185,10 +2185,26 @@ private:
             return;
         }
 
-        // dump side is text-only (A39.1); skip early when either side carries media
-        if (slot.prompt.tokens.has_mtmd || incoming.has_mtmd) {
-            SLT_INF(slot, "kv stash: fork_check skipped, mtmd present (slot=%d incoming=%d)\n",
-                    (int) slot.prompt.tokens.has_mtmd, (int) incoming.has_mtmd);
+        // dump side is text-only (A39.1); skip early when either side carries media.
+        // A62 fix (2026-11-16): the original guard tested has_mtmd, but on the OAI chat path
+        // that is a *capability* flag, not a per-request media flag: every chat request on an
+        // mmproj model goes through process_mtmd_prompt (server-context.cpp:5786-5788), which
+        // returns has_mtmd=true even for a text-only prompt (push_back only inserts
+        // LLAMA_TOKEN_NULL for IMAGE/AUDIO chunks, server-common.cpp:629-648), and the slot's
+        // saved prompt is flagged the same way (server-context.cpp:1590:
+        // slot.prompt.tokens.has_mtmd = mctx != nullptr). On the production model (mmproj
+        // loaded) the old guard was therefore true for EVERY chat request and the fork-dump
+        // trigger could never fire - this is the 11/16 silent non-fire (A62 campaign 132610:
+        // "fork_check skipped, mtmd present (slot=1 incoming=1)" on all four test tasks).
+        // Mirror the two sibling stash guards (dump: kv_stash_dump_slot, restore:
+        // kv_stash_try_restore) and test for actual media placeholders in the raw token
+        // stream instead.
+        const llama_tokens & raw_slot = slot.prompt.tokens.get_raw_tokens();
+        const llama_tokens & raw_in   = incoming.get_raw_tokens();
+        if (kstash::stream_has_media(raw_slot.data(), raw_slot.size()) ||
+            kstash::stream_has_media(raw_in.data(), raw_in.size())) {
+            SLT_INF(slot, "kv stash: fork_check skipped, media present (slot_raw_tok=%zu in_raw_tok=%zu)\n",
+                    raw_slot.size(), raw_in.size());
             return;
         }
 
