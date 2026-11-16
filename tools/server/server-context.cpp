@@ -2175,11 +2175,19 @@ private:
     // so a sidecar implies a complete dump.
     void kv_stash_fork_dump_check(server_slot & slot, const server_tokens & incoming) {
         if (!kv_stash_enabled()) {
+            // A62: make the early exit visible (the 11/16 silent non-fire could be any of the
+            // three pre-decision exits; without these lines "no fork_check in the log" is
+            // indistinguishable from "check not reached")
+            // note: the SLT_* macros expand with a trailing comma when the varargs list is
+            // empty (C2059 under /std:c++17), so every call below carries >= 1 real vararg
+            SLT_DBG(slot, "kv stash: fork_check skipped, kv-stash disabled (n_incoming_tok=%zu)\n", incoming.size());
             return;
         }
 
         // dump side is text-only (A39.1); skip early when either side carries media
         if (slot.prompt.tokens.has_mtmd || incoming.has_mtmd) {
+            SLT_DBG(slot, "kv stash: fork_check skipped, mtmd present (slot=%d incoming=%d)\n",
+                    (int) slot.prompt.tokens.has_mtmd, (int) incoming.has_mtmd);
             return;
         }
 
@@ -2187,6 +2195,16 @@ private:
         const llama_tokens in_toks = incoming.get_text_tokens();
 
         kstash::fork_check fc = kstash::check_fork_dump(toks.data(), toks.size(), in_toks.data(), in_toks.size());
+
+        // A62: entry-level observability of the decision itself. SLT_INF when the trigger
+        // fires (visible at any log level), SLT_DBG otherwise (visible at -lv 4, which the
+        // prod launcher uses). tail/fork expose why should_dump is false when it is.
+        if (fc.should_dump) {
+            SLT_INF(slot, "kv stash: fork_check tail=%zu fork=%zu should_dump=%d\n", fc.tail, fc.fork, 1);
+        } else {
+            SLT_DBG(slot, "kv stash: fork_check tail=%zu fork=%zu should_dump=%d\n", fc.tail, fc.fork, 0);
+        }
+
         if (!fc.should_dump) {
             return;
         }
@@ -4506,6 +4524,11 @@ private:
                             if (slot.task->params.cache_prompt && !slot.task->is_stateless()) {
                                 // fork A40 phase-1: stash the outgoing conversation before the
                                 // common-prefix mutation can rewind the slot past it
+                                // A62: reachability probe - the 11/16 synthetic test found zero fork-dump
+                                // lines on a qualifying alternation; if the check is not even reached,
+                                // this is the line that will be missing from the log
+                                SLT_DBG(slot, "kv stash: fork_dump_check call site (n_prompt_tok=%zu, n_incoming_tok=%zu)\n",
+                                        slot.prompt.tokens.size(), input_tokens.size());
                                 kv_stash_fork_dump_check(slot, input_tokens);
 
                                 // reuse any previously computed tokens that are common with the new prompt
