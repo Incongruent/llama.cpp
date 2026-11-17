@@ -9,9 +9,11 @@ quantized models across two GPUs of *different generations* over plain PCIe:
 
 The upstream multi-GPU paths assume reasonably homogeneous, modern hardware.
 The patches here remove incidental assumptions that block this configuration,
-add one placement knob for hybrid-attention models, and vectorize a hot
-K-quant to f16 conversion path. Every change is opt-in or behavior-preserving
-by default, and each is its own commit so it can be dropped independently.
+add one placement knob for hybrid-attention models, vectorize a hot K-quant
+to f16 conversion path, and add an on-disk KV stash (with prefix salvage and
+fork-dump) that survives router model swaps and server restarts. Every change
+is opt-in or behavior-preserving by default, and each is its own commit so it
+can be dropped independently.
 
 Target workload: Qwen3.8-27B (hybrid attention, ~27B parameters) quantized
 with Q6_K/Q5_K tensors, tensor-split across both devices. The changes are
@@ -24,6 +26,7 @@ developed and measured on.
 | --- | --- | --- |
 | `pre-a1` | `snapshot-pre-a1` | Pascal internal AllReduce; one-shot MMQ config debug log |
 | `a1-a4` | `snapshot-a1-a4` | everything above, plus A1–A4 below |
+| `prod` | — | current integration line: A1/A5/A9/A12/A13/A15/A16/A19/A23 plus A39 (kv-stash) with the A40/A42/A59/A60/A61/A62 follow-ups |
 
 `git diff pre-a1..a1-a4` is exactly the A1–A4 delta.
 
@@ -58,8 +61,11 @@ AllReduce while keeping link traffic negligible.
 
 Expected effect: the chunked internal AllReduce becomes usable on Pascal
 instead of being rejected. This matters on systems without NCCL, where the
-fallback multi-GPU path is otherwise markedly slower. No measured
-before/after numbers are recorded yet.
+fallback multi-GPU path is otherwise markedly slower. Measured (indirect,
+9B A/B on the target pair): with the pipeline engaged,
+`GGML_CUDA_AR_DISABLE=1` costs about −0.8% TG and −2% PP, so the internal
+AllReduce is mildly ahead of the fallback path; no direct AR-latency number
+was captured.
 
 ### 2. One-shot MMQ config debug log
 
@@ -133,6 +139,16 @@ bandwidth-bound recurrent layers from the slow-large device to the
 fast-small one: during decode those layers stream weights while the fast
 device is otherwise idle, and during prefill their GEMMs run on the faster
 compute.
+
+Outcome (2026-11-11): the `recr:M` staging campaign was closed REJECTED.
+Measured on the target pair with the 27B hybrid workload: the recurrent
+compute buffer is context-scaled and invariant to the recr count, each
+staged recurrent layer costs ~550 MB of weights on device 0, and demoting
+an attention layer to make room costs ~0.94 TG against ~0.06 TG gained per
+staged layer. The best feasible corner (`attn:15,recr:1`, TG 8.84 t/s) is
+still ~9% below plain `attn:16` (9.72 t/s). The grammar stays implemented
+and `off` remains the default; production uses plain `attn:N` only.
+Details: [docs/a19-recr-placement-bench-report-20261111.md](docs/a19-recr-placement-bench-report-20261111.md).
 
 ### A2 — P2P setup is tri-state and tolerant (`GGML_CUDA_P2P`)
 
@@ -249,8 +265,8 @@ output unchanged. The mismatched digest on the second profile produced a
 full prefill as expected, and the persisted files were accepted after
 process restart.
 
-Production validation (dual-GPU hybrid Qwen ladder, 3080+P40 rig; reports
-`C:\code\A39_TEST_REPORT_20261109.md` and `A39_TEST_REPORT_20261110.md`):
+Production validation (dual-GPU hybrid Qwen ladder, 3080+P40 rig; host-side
+reports `A39_TEST_REPORT_20261109.md` and `A39_TEST_REPORT_20261110.md`):
 the 11-09 epoch passed with 7 dumps / 4 restore legs (~230k tokens of
 re-prefill avoided); the 11-10 epoch ran 1/10 restore legs with all 9
 refusals by design (superset-check rejections after client-side
@@ -260,11 +276,65 @@ first-mismatch index: the first refusal diverged at token 6019 of an
 token 0, unsalvageable by any disk state). The CPU 0.8B smoke above is a
 mechanism check only; the ladder above is the A39 evidence base.
 
+### A23 — fused-GDN path selection (`--fgdn`)
+
+New server flag `--fgdn on|off-ch|off-all|auto` (env `LLAMA_ARG_FGDN`),
+default `on`, selecting the fused Gated Delta Net kernel path for
+hybrid-recurrent models:
+
+- `on`: fused kernel for both decode and prefill.
+- `off-ch`: prefill takes the graph-chunking path (cumsum/tri/matmul),
+  decode stays fused.
+- `off-all`: both phases take the unfused paths.
+- `auto`: `off-ch` when any GPU device has compute capability < 7.0 (the
+  fused kernel falls back to a token-serial scan over `n_tokens` there),
+  else `on`. The probe compares against the fork's cc encoding,
+  `100*major + 10*minor` (P40 = 610, 3080 = 860); the initial threshold
+  check misread that encoding and was fixed.
+
+Measured on the 3080+P40 rig with the 27B hybrid workload: no PP or TG
+difference between `on` and `off-ch` — the fused fallback kernel is not
+the bottleneck there. `auto` resolves to `off-ch` on this pair (the P40 is
+cc 6.1), which is equivalent within noise; `on` stays the default.
+
+### A40/A59–A62 — KV-stash follow-ups: salvage, pruning, fork-dump
+
+Follow-up items landed on the A39 machinery. All are automatic once
+`--kv-stash-dir` is enabled; no new flags.
+
+- A59 refusal instrumentation: stash refusals log the first-mismatch token
+  index and a salvage verdict instead of a bare refusal, so an unsalvageable
+  prefix (rewritten from token 0) is distinguishable from a near miss.
+- A59 phase-2 gated salvage: an interior-divergence restore is allowed when
+  the salvageable prefix reaches a minimum length (4096 tokens); below that
+  the state is refused in favor of a full re-prefill.
+- A42/A59 convergence: a salvage restores the full saved state including
+  context checkpoints, and the processing loop rolls back to the covering
+  checkpoint, bounding the tail re-prefill on hybrid models. Final
+  full-epoch soak: 61 consults, 17/28 salvage wins, ~215 minutes of
+  re-prefill saved, plus an asymmetry in how the 9B profile consults the
+  stash was identified. Details:
+  [docs/a42-salvage-convergence-report-20261112.md](docs/a42-salvage-convergence-report-20261112.md).
+- A60: the stash pruner compared an 8-char `.kvstate` suffix against a
+  7-char tail and never matched, so `--kv-stash-limit-mib` pruning was a
+  silent no-op; fixed, and the cap now actually evicts oldest-first.
+- A40/A61 same-preset fork-dump: when an incoming prompt forks out of the
+  resident slot tail early (shared prefix below 90% of a tail of at least
+  2048 tokens), the resident tail is stashed before the slot rewinds, so
+  same-preset conversation alternation keeps its KV on disk. The dump
+  fires on the STOP unwind rather than depending on a timeout.
+- A62 fork-dump observability: the fork-check decision logs at INF
+  (visible at `-lv 4`) with the tail/fork/should_dump triple and the
+  pre-decision exits. Also fixed: the mtmd guard used the `has_mtmd`
+  capability flag — true for every chat request on an mmproj model — so
+  the trigger silently never fired; it now tests for actual media
+  placeholders like the sibling dump/restore guards.
+
 ## Performance summary
 
 | Change | Mechanism | Expected effect | Measured |
 | --- | --- | --- | --- |
-| Pascal internal AllReduce | `clock()` spin, cc gate lowered, opt-out env | Internal AR available on cc 6.1; lower AR latency than the no-NCCL fallback; ~8–11 µs poll interval keeps PCIe TLP traffic negligible | pending |
+| Pascal internal AllReduce | `clock()` spin, cc gate lowered, opt-out env | Internal AR available on cc 6.1; lower AR latency than the no-NCCL fallback; ~8–11 µs poll interval keeps PCIe TLP traffic negligible | engaged by default; `GGML_CUDA_AR_DISABLE=1` costs ~−0.8% TG / ~−2% PP on the 9B A/B, i.e. mildly ahead of the fallback; no direct AR-latency number (A9 knob sweep below) |
 | MMQ log + tile A/B | one-shot log; `I` 64→32 experiment | log is diagnostic; the tile-width experiment was refuted (−16…−25% PP, no occupancy gain) and reverted | measured: rejected ([details](MMQ_PASCAL_TILE_EXPERIMENT.md)) |
 | A1 hybrid placement | attention layers pinned to device 0 | operator-tunable balance: latency-critical layers on the fast device, capacity on the large device | measured: `attn:12` on 3080+P40, PP +34.6%, TG +23.2% vs off ([details](HYBRID_LAYER_SPLIT_BENCHMARK.md)) |
 | A2 P2P tri-state | auto-enable where supported, tolerate failures | no regression; P2P used only where actually supported | measured: neutral on the no-P2P pair, PP 135.86 vs 135.88 / TG 12.93 vs 13.17, identical output ([details](HYBRID_LAYER_SPLIT_BENCHMARK.md)) |
@@ -280,28 +350,38 @@ mechanism check only; the ladder above is the A39 evidence base.
 | A16 arch gate | `scripts/check-arch.ps1` SASS readback + startup cc banner | catches silent `-DCMAKE_CUDA_ARCHITECTURES` drift; triages slow-device reports | measured 2026-11-07 on an 86-only rebuild: banner fires ("Device 1: cc 6.1 not in compiled SASS arch list (860), no compiled arch is compatible - device requires PTX JIT"); gate FAILs on missing 61; behavior note: on missing SASS the scheduler silently schedules around the P40 (model buffer 5562 MiB -> CUDA0 + 667 MiB CPU_Mapped, no CUDA1 buffers, no WARN in server log) — the banner (stderr at backend init, not in --log-file) + the SASS gate are the only alarms; `-Expected` list parsing normalized (was binding "61,86" as one literal string) |
 | A1dig depth sweep | extend hybrid quota 12 -> all 16 attention layers by moving draft tower + output head off device 0 | all attention compute on the fast device; model headroom created by relocating the only remaining device-0 residents | measured 2026-11-07 (27B Q6_K, q8_0 KV, 90% fill, n_predict 512, draft-mtp): prod-style `attn:12` (draft+output on CUDA0) baseline PP 184.5 / TG 8.34 / acc 0.278; `attn:16` + draft & output on CUDA1 fits at ctx 100096/ub512 (PP 212.1 +15.0%, TG 9.58 +14.9%, acc 0.291) and at ctx 103168/ub256 (PP 206.5 +12.0%, TG 9.26 +11.0%, acc 0.283); `attn:15` both-moved fits at the FULL prod shape 105216/ub1024 (PP 217.8 +18.1%, TG 8.91 +6.8%, acc 0.294); temp-0 output identical across all configs; attn:13–15 with output kept on CUDA0 all OOM (output.weight ≈ 511 MiB is the CUDA0 hog; draft tower + output = 991 MiB combined); marginal cost per attention layer on device 0 = 291.25 MiB weights + 218.35 MiB KV (ctx 105216, q8_0); fit ceiling: attn:16 needs ctx <= ~103000 at ub 256, ctx <= 100096 at ub 512; 105216/attn:16 infeasible even at ub 256 |
 | A1dig mmproj offload | `--mmproj-device CUDA1` moves vision tower + its compute off the fast device (worst-case 1157.64 MiB resident there by default) | frees the mmproj KV-extend blocker on device 0 so attn:16 reaches the FULL production shape, and uses the large device for vision | measured 2026-11-07 (27B Q6_K): attn:16 + mmproj on CUDA1 now fits ctx 105216/ub 1024 (4660.03 + 3493.50 + 776.53, smi 9739/10240) and even ub 2048 (9300, ~309 free); 90% fill PP 235.4 (+27.6% vs prod attn:12 shape) / TG 9.29 (+11.4%) / acc 0.279; original one-shot rig (100,490 tok, n=512): PP 232.5 (+38.1% vs rerun attn:12 168.3), TG 18.05 (+5.4% vs 17.12), wall 460.5 s (−26.6% vs 626.9); temp-0 identity identical; vision smoke on device 1 (cc 6.1) dispatches clean and answers a test image correctly; ub 2048 leg fits but prefill inverts (235.4 -> 210.2 PP) and only +0.65 TG — ub 1024 stays ([details](HYBRID_LAYER_SPLIT_BENCHMARK.md)) |
+| A19 recr placement | `recr:M` recurrent-layer quota on device 0 | move bandwidth-bound GDN layers to the fast device during decode, faster GEMMs during prefill | measured: REJECTED — best feasible corner `attn:15,recr:1` TG 8.84 t/s vs plain `attn:16` 9.72 t/s (−9%); recr compute buffer is ctx-scaled, per-recr cost ~550 MB weights; production stays plain `attn:N` ([details](docs/a19-recr-placement-bench-report-20261111.md)) |
+| A23 fused-GDN selection | `--fgdn on/off-ch/off-all/auto` picks fused vs graph-chunking GDN prefill per device capability | avoid the token-serial fused fallback on pre-Volta devices; keep the fused path elsewhere | measured: neutral on the 3080+P40 pair (on vs off-ch within noise — the fused fallback kernel is not the bottleneck there); auto cc-probe fixed to the fork cc encoding (P40 = 610, 3080 = 860) |
+| A39/A40/A42 kv-stash salvage | on-disk slot states + checkpoint-rollback salvage + same-preset fork-dump | avoid re-prefilling conversation prefixes across router model swaps and conversation alternation | measured: A39 ladder epochs ~230k tokens of re-prefill avoided (11-09 epoch); A42 final soak 61 consults, 17/28 salvage wins, ~215 min saved ([details](docs/a42-salvage-convergence-report-20261112.md)) |
 
-Three measured results exist so far: the MMQ tile-width experiment
-([details](MMQ_PASCAL_TILE_EXPERIMENT.md)), refuted and reverted; the A1
-hybrid placement A/B ([details](HYBRID_LAYER_SPLIT_BENCHMARK.md)), with
-`attn:12` at PP +34.6% / TG +23.2% over `off`; and the A2 P2P toggle,
-neutral on the no-P2P pair. Attribution: A1 accounts for the entire
-speedup; A2 is measured neutral, A4 is not exercised by the measured
-workload, and A3 is bounded within the same noise band as A2+A3+A4
-jointly. Everything still marked "pending" should be treated as expected
-effects derived from the code, not as results.
+The early A1–A4 results stand as measured: the MMQ tile-width experiment
+([details](MMQ_PASCAL_TILE_EXPERIMENT.md)) was refuted and reverted; the A1
+hybrid placement A/B ([details](HYBRID_LAYER_SPLIT_BENCHMARK.md)) gives
+`attn:12` PP +34.6% / TG +23.2% over `off`, and the deeper `attn:16` /
+mmproj-offload corners add a further +11–15% TG on top of `attn:12`; the A2
+P2P toggle is neutral on the no-P2P pair. Attribution: A1 (placement) and
+the A39/A42 KV-stash (prefix reuse across swaps) account for essentially
+the entire speedup; A2 is measured neutral, A4 is not exercised by the
+measured workload, A3 is bounded within the same noise band as the
+A2+A3+A4 joint legs, and A23 is neutral on this pair. Items measured and
+NOT adopted: A19 `recr:M` staging (rejected, −9% TG vs plain `attn:16`),
+A44 b-shift (bench gate failed on correctness, not merged), A47 scheduler
+events (mechanism proven, impact nil), A55 p_min early-stop (adopted, then
+reverted on soak evaluation).
 
 ## Validation status
 
 - All modified translation units compile cleanly with CUDA 12.9 for
   `sm_61` + `sm_86` (MMQ, flash attention, CUDA graphs enabled) and with
   MSVC for the host-side changes.
-- The MMQ tile-width A/B ([details](MMQ_PASCAL_TILE_EXPERIMENT.md)) was
-  measured on a live build (log patch applied); the experiment itself was
-  reverted.
-- A full link and runtime pass is the next step; runtime validation
-  (tensor-split correctness, AllReduce numerics, pipeline-parallel output
-  stability) is still pending.
+- Runtime validation is operational: the fork has been serving the 27B
+  hybrid production workload on the dual-GPU rig across multi-day soaks,
+  with temp-0 identity gates in every A/B leg, KV-stash ladder epochs, and
+  full-epoch salvage soaks. Per-item evidence is in the sections above and
+  the linked reports.
+- Evaluated and NOT adopted (no code on `prod`): A19 `recr:M` staging,
+  A44 b-shift, A47 scheduler events, A55 p_min early-stop — each measured
+  under the fixed A/B harness and rejected/reverted with a report.
 - A39: compiles as a CPU-only host-side change; router swap smoke on a
   CPU-only 0.8B build passes (stash save at child unload, same-digest
   restore on the next load, mismatched digest ignored, identity output
@@ -342,6 +422,7 @@ cmake --build build --config Release
 | `LLAMA_OUTPUT_PIN` | `off`/unset (default), any other value | pin the output/logits head to the last GPU device (A13) |
 | `LLAMA_ARG_KV_STASH_DIR` | path, empty off (A39) | enable the on-disk KV stash (`--kv-stash-dir`) |
 | `LLAMA_ARG_KV_STASH_LIMIT_MIB` | MiB count (default 16384, 0 = no limit) | prune the KV stash after each save (`--kv-stash-limit-mib`) |
+| `LLAMA_ARG_FGDN` | `on`, `off-ch`, `off-all`, `auto` (default `on`) | fused-Gated-Delta-Net path selection for hybrid-recurrent models (`--fgdn`, A23) |
 
 All other behavior is unchanged from upstream. No telemetry is added and no
 persistent configuration is modified; the only file writes beyond the
