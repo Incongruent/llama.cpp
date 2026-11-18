@@ -101,13 +101,22 @@ processes before a run, and gate every long leg (the fit/bench harnesses do).
   identical to the (a) family at equal context, so their deep behavior is assumed, not
   measured).
 - Everything else in the parent report stands unchanged; scenario D remains at its
-  current preset depth (the 262,144-slot top-up stays a one-line pending decision).
+  current preset depth — see §7 for the resolved 262,144-slot top-up decision.
 
 ## 7. Pending / handoffs
 
 - T7 quality battery (owned elsewhere) — now has a concrete new target: depth-quality at
   the 280k/290k rungs, where extrapolated KV positions see scales up to 1.10637.
-- The 262,000 → 262,144 scenario-D ctx top-up needs an explicit decision (margins shrink
-  to ~0.5 GB slow-card / ~0.8 GB fast-card at `-np 1`).
+- **DECIDED 2026-11-17 (backlog T14): scenario D adopts 262,000 — no top-up, no re-bench.**
+  The pending item asked whether to raise the D rung's nominal ceiling from 262,000 to
+  262,144, the 16-alignment boundary. The top-up is a no-op at the slot level: context is
+  padded to a 256-token multiple before the KV buffers are sized
+  (`cparams.n_ctx = GGML_PAD(cparams.n_ctx, 256)`, `src/llama-context.cpp:411`), so any
+  declared value in (261,888, 262,144] already produces `n_ctx_slot = 262,144`. Measured on
+  this build at 118,000 → 118,016 (461 × 256). Declaring 262,144 would therefore add zero
+  KV cells while reading as a depth increase, and the ~0.5 GB slow-card / ~0.8 GB
+  fast-card fill margins at `-np 1` are unchanged either way. Adopted shape: the D preset
+  keeps its stored declared ctx (a 256-multiple rung, 259,000 → 259,072 slots); the
+  scenario note lives in `models_benchmarked.ini`.
 - Single-rep transparency: every ladder number above is one rep; the parent report's
   variance discipline (reps≥3 for headline claims) applies equally here.
